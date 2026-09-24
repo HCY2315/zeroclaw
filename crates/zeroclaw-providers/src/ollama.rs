@@ -1,3 +1,21 @@
+//! Ollama（本地/远程推理服务）的 `ModelProvider` 实现。
+//!
+//! 职责：把 ZeroClaw 内部统一的聊天请求翻译成 Ollama 的 HTTP API
+//! （`POST {base_url}/api/chat`），再把 Ollama 响应翻译回统一的 `ChatResponse`。
+//!
+//! 一次 `chat*` 调用的完整数据流：
+//!   1. `resolve_request_details`          处理模型名（`:cloud` 后缀）与鉴权决策
+//!   2. `convert_messages`                 内部 `ChatMessage` → Ollama wire 格式 `Message`
+//!   3. `build_chat_request_with_think`     组装请求体（options / think / tools）
+//!   4. `send_request`                      发 HTTP；`think=true` 失败时降级重试一次
+//!   5. `response_to_chat_response`         Ollama 响应 → 统一 `ChatResponse`
+//!      （剥离 `<think>` 思考标签、容忍空 content、提取工具调用）
+//!
+//! 关键事实：本 provider **不走 Ollama 原生工具协议**（`supports_native_tools()`
+//! 返回 `false`），工具说明通过 `with_prompt_guided_tool_instructions` 拼进
+//! system prompt（提示词引导），模型吐出的工具调用再被序列化成 JSON 字符串，
+//! 交给上层 `loop_.rs` 的通用解析器去识别。
+
 use crate::multimodal;
 use crate::ollama_wire::{
     ApiChatResponse, ChatRequest, Message, OllamaToolCall, Options, OutgoingFunction,
@@ -33,6 +51,9 @@ pub const OLLAMA_DEFAULT_NUM_CTX: u32 = 8192;
 /// server-side default is 128, which silently truncates responses.
 pub const OLLAMA_DEFAULT_NUM_PREDICT: i32 = 2048;
 
+/// Ollama 的运行参数（每次请求都会带上）。
+/// 因为 Ollama 服务端默认的 `num_ctx`/`num_predict` 很小（会悄悄截断输入/输出），
+/// 这里用更大的默认值兜底，operator 可以通过配置覆盖。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OllamaTuning {
     pub num_ctx: u32,
@@ -150,6 +171,8 @@ impl OllamaBuilder {
 }
 
 impl OllamaModelProvider {
+    /// 规整 base_url：去掉首尾空白、尾部 `/`，并剥掉可能误配的 `/api`、
+    /// `/api/chat` 后缀（拼请求时后缀是由代码统一加的）。
     fn normalize_base_url(raw_url: &str) -> String {
         let trimmed = raw_url.trim().trim_end_matches('/');
         if trimmed.is_empty() {
@@ -179,6 +202,8 @@ impl OllamaModelProvider {
         self.tuning
     }
 
+    /// endpoint 是否指向本机（localhost / 127.0.0.1 / ::1 / 0.0.0.0）。
+    /// 本地 Ollama 不需要也不应发送 Bearer 鉴权。
     fn is_local_endpoint(&self) -> bool {
         reqwest::Url::parse(&self.base_url)
             .ok()
@@ -188,6 +213,8 @@ impl OllamaModelProvider {
             })
     }
 
+    /// endpoint 是否是 Ollama 官方托管云（ollama.com / api.ollama.com）。
+    /// 只有官方云才认 `:cloud` 后缀路由语义。
     fn is_official_cloud_endpoint(&self) -> bool {
         reqwest::Url::parse(&self.base_url)
             .ok()
@@ -200,6 +227,8 @@ impl OllamaModelProvider {
             .unwrap_or(false)
     }
 
+    /// 构造带代理与超时配置的 HTTP 客户端（读全局 config 的代理设置，
+    /// 连接超时 10s、读超时 300s——本地推理可能较慢，故读超时给得宽）。
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.ollama",
@@ -208,6 +237,13 @@ impl OllamaModelProvider {
         )
     }
 
+    /// 请求前的模型名规整 + 鉴权决策，返回 `(实际发送的模型名, 是否需要 Bearer)`。
+    ///
+    /// 决策矩阵：
+    /// - `qwen3:cloud` + 官方云 endpoint → 剥掉 `:cloud`（云上默认就是云），且**必须**有 api_key
+    /// - `:cloud` + 本地 endpoint → 报错（本地没法路由到云，要求改配远程 endpoint）
+    /// - 私有远程 endpoint → `:cloud` 原样透传（它是不是云由服务端自己解释）
+    /// - 是否附带 Bearer：配了 key **且**不是本地 endpoint 才发
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {
         let requests_cloud = model.ends_with(":cloud");
         let official_cloud_endpoint = self.is_official_cloud_endpoint();
@@ -254,6 +290,10 @@ impl OllamaModelProvider {
     /// Qwen and other reasoning models may embed chain-of-thought inline
     /// in the `content` field using `<think>` tags.  These must be stripped
     /// before returning text to the user or parsing for tool calls.
+    /// 去掉 ` thinking... response` 标签之间的推理内容。
+    /// Qwen 等推理模型会把思维链（chain-of-thought）内嵌在 `content` 字段里，
+    /// 用一对 ` thinking` / ` response` 标签包裹。给用户看文本或解析工具调用之前，
+    /// 必须先把这段"内心活动"剥掉，否则会污染输出。
     fn strip_think_tags(s: &str) -> String {
         let mut result = String::with_capacity(s.len());
         let mut rest = s;
@@ -278,6 +318,10 @@ impl OllamaModelProvider {
     /// and falling back to the `thinking` field when `content` is empty after
     /// stripping.  This ensures that tool-call XML tags embedded alongside (or
     /// after) thinking blocks are preserved for downstream parsing.
+    /// 从响应里取出真正要展示的文本：先剥 ` thinking` 标签看 `content`；
+    /// 如果 content 剥完是空的，就退回用 `thinking` 字段当正文。
+    /// 背景：Qwen 等模型在 `think: true` 时可能把完整输出（包括工具调用
+    /// XML）放在 `thinking` 字段里，`content` 却是空的。
     fn effective_content(content: &str, thinking: Option<&str>) -> Option<String> {
         // First try the content field with think tags stripped.
         let stripped = Self::strip_think_tags(content);
@@ -306,6 +350,9 @@ impl OllamaModelProvider {
         None
     }
 
+    /// 模型返回了空 content 又没有工具调用时兜底：造一句给用户看的回复
+    /// （并且记录一条 WARN 日志便于观察）。分两种情况——
+    /// 有 thinking 说明模型"想了一半就停了"；什么都没有就按"异常空响应"处理。
     fn fallback_text_for_empty_content(model: &str, thinking: Option<&str>) -> String {
         if let Some(thinking) = thinking.map(str::trim).filter(|value| !value.is_empty()) {
             let thinking_log_excerpt: String = thinking.chars().take(100).collect();
@@ -378,6 +425,10 @@ impl OllamaModelProvider {
         }
     }
 
+    /// 从用户消息里解析图片标记：ZeroClaw 的统一 `ChatMessage` 用内嵌标记
+    /// （`multimodal::parse_image_markers`）来携带图片；解析出的图片以
+    /// Ollama 要求的 base64 payload 形式放到 `images` 数组里，正文只保留
+    /// 剥掉标记后的纯文本。没有图片标记时原样返回。
     fn convert_user_message_content(&self, content: &str) -> (Option<String>, Option<Vec<String>>) {
         let (cleaned, image_refs) = multimodal::parse_image_markers(content);
         if image_refs.is_empty() {
@@ -403,7 +454,19 @@ impl OllamaModelProvider {
         (content, Some(images))
     }
 
+    /// 把 ZeroClaw 内部消息逐个翻译成 Ollama wire 格式的 `Message`。
+    ///
+    /// 三种特殊角色各自处理：
+    /// - `assistant`：content 里可能内嵌了 `{"tool_calls": [...]}` JSON
+    ///   （来自上一轮我们自己的序列化），需要拆出来变成 Ollama 的
+    ///   `tool_calls` 字段，并把 "tool call id → 工具名" 记进一张表，
+    ///   供后面的 `tool` 消息反查工具名。
+    /// - `tool`：工具执行结果，同样是 JSON，从中取 `tool_name`（或借
+    ///   `tool_call_id` 反查）和 `content`，转成 Ollama 的 tool 消息。
+    /// - `user`：走 `convert_user_message_content` 解析图片。
     fn convert_messages(&self, messages: &[ChatMessage]) -> Vec<Message> {
+        // 记录 "tool_call_id → 工具名" 的反查表：Ollama 的 tool 消息要靠它
+        // 关联上是哪一次调用、调用的哪个工具。
         let mut tool_name_by_id: HashMap<String, String> = HashMap::new();
 
         messages
@@ -494,6 +557,9 @@ impl OllamaModelProvider {
             .collect()
     }
 
+    /// 由于不支持原生工具协议，把工具定义转成"文本指令"并注入 system 消息。
+    /// 这样模型能"看到"有哪些工具可调用，返回时再用 `format_tool_calls_for_loop`
+    /// 把模型吐出的工具调用序列化成统一 JSON 字符串。
     fn with_prompt_guided_tool_instructions(
         &self,
         messages: &[ChatMessage],
@@ -522,6 +588,14 @@ impl OllamaModelProvider {
         Ok(modified_messages)
     }
 
+    /// 把 Ollama 的 `/api/chat` 响应翻译成 ZeroClaw 统一的 `ChatResponse`。
+    ///
+    /// - 有工具调用 → 规整成 `Vec<ToolCall>`（含 id/name/arguments）；Text
+    ///   部分因为模型可能在调工具前也说点话，仍会保留。
+    /// - 没有工具调用 → 规整出要展示的文本（剥 think 标签、必要时退回
+    ///   `thinking` 字段、空内容走兜底话术）。
+    /// - token 用量：Ollama 返回 `prompt_eval_count`/`eval_count` 时才填，
+    ///   否则 `usage` 为 `None`。
     fn response_to_chat_response(&self, response: ApiChatResponse, model: &str) -> ChatResponse {
         let usage = if response.prompt_eval_count.is_some() || response.eval_count.is_some() {
             Some(TokenUsage {
@@ -579,6 +653,10 @@ impl OllamaModelProvider {
     }
 
     /// Send a single HTTP request to Ollama and parse the response.
+    /// 真正发一次 HTTP 请求到 Ollama `/api/chat`：
+    /// 组装请求体 → 按需附加 Bearer 鉴权 → 处理非 2xx 错误体
+    /// （先脱敏再告警，避免把密钥/日志文本泄进错误信息）→ 反序列化响应。
+    /// 若响应体解析失败，同样脱敏后报错。
     async fn send_request_inner(
         &self,
         messages: &[Message],
@@ -668,6 +746,10 @@ impl OllamaModelProvider {
         Ok(chat_response)
     }
 
+    /// 带"think 重试降级"的发请求入口。
+    /// 如果配置了推理模式（`think=true`）但当前模型并不支持，Ollama 会报错；
+    /// 这时去掉 think 再重试一次。若两次都失败，保留第一次的原始错误上报，
+    /// 只把重试错误记进日志。
     async fn send_request(
         &self,
         messages: Vec<Message>,
@@ -713,6 +795,10 @@ impl OllamaModelProvider {
         }
     }
 
+    /// 把 Ollama 返回的工具调用列表格式化成上层 `loop_.rs` 通用解析器
+    /// （`parse_tool_calls`）认识的 JSON 字符串。因为本 provider 不用原生
+    /// 工具协议，模型吐出的工具调用要走统一的"文本回灌"通道，这里拼成
+    /// 与 OpenAI 一致的 `{"content": "", "tool_calls": [...]}` 形状。
     fn format_tool_calls_for_loop(&self, tool_calls: &[OllamaToolCall]) -> String {
         let formatted_calls: Vec<serde_json::Value> = tool_calls
             .iter()
@@ -742,6 +828,9 @@ impl OllamaModelProvider {
     }
 
     /// Extract the actual tool name and arguments from potentially nested structures
+    /// 从可能的嵌套结构里提取真实工具名 + 参数（模型输出工具调用时格式千奇百怪）。
+    /// 处理三类情况：套了 `tool_call`/`tool.call`/`tool_call>` 之类包装的、
+    /// 带 `tool.` 前缀的、以及正常的。
     fn extract_tool_name_and_args(&self, tc: &OllamaToolCall) -> (String, serde_json::Value) {
         let name = &tc.function.name;
         let args = &tc.function.arguments;
@@ -781,21 +870,41 @@ impl OllamaModelProvider {
     }
 }
 
+// ─── ModelProvider trait 实现 ───────────────────────────────────────────────
+//
+// 这是 ZeroClaw 运行时真正调用的对外接口。四个 chat_* 方法是不同入口，
+// 但底层都汇到 send_request → response_to_chat_response 这条主干上：
+//   - chat_with_system / chat_with_history：不传工具，拿纯文本回复
+//   - chat_with_tools / chat：可带工具；因为 supports_native_tools() 是 false，
+//     工具是通过 prompt 引导（系统提示里塞指令）而不是原生协议传的
+// capabilities() 告诉运行时这个 provider 的能力边界（不支持原生工具/缓存/扩展思考）。
 #[async_trait]
 impl ModelProvider for OllamaModelProvider {
     // ── ModelProvider-family defaults ──
+    //
+    // 下面三个 default_* 方法给运行时提供"本 provider 家族"的保守默认值，
+    // 运算符没有显式配置时就用这些。
+
+    /// 默认采样温度 0.8（对齐 Ollama Modelfile 官方默认）。
     fn default_temperature(&self) -> f64 {
         TEMPERATURE_DEFAULT
     }
 
+    /// 默认请求超时 600s。本地推理跑在 CPU/GPU 上，可能比云上慢得多。
     fn default_timeout_secs(&self) -> u64 {
         TIMEOUT_SECS_DEFAULT
     }
 
+    /// 默认服务地址：本地端点 `http://localhost:11434`。
     fn default_base_url(&self) -> Option<&str> {
         Some(BASE_URL)
     }
 
+    /// 向运行时声明本 provider 的能力边界：
+    /// - 不支持原生工具协议（工具靠 prompt 引导）；
+    /// - 支持视觉输入（vision）；
+    /// - 不支持 prompt 缓存 / 扩展思考。
+    /// 运行时据此决定走哪条工具路径、能否发图片等。
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: false,
@@ -805,6 +914,9 @@ impl ModelProvider for OllamaModelProvider {
         }
     }
 
+    /// 最简单的单轮入口：只有 system prompt + 一条用户消息，无历史、
+    /// 无工具。返回纯文本（若模型意外返回工具调用，则序列化成 JSON 字符串
+    /// 交给上层解析器，而不是丢失）。
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -866,6 +978,9 @@ impl ModelProvider for OllamaModelProvider {
         ))
     }
 
+    /// 带完整对话历史的入口：把内部 `ChatMessage` 翻译成 Ollama wire 格式
+    /// 后发送（无工具）。返回的是纯文本字符串；若模型返回工具调用，同样
+    /// 序列化成 JSON 字符串交回上层解析器。
     async fn chat_with_history(
         &self,
         messages: &[crate::traits::ChatMessage],
@@ -913,6 +1028,10 @@ impl ModelProvider for OllamaModelProvider {
         ))
     }
 
+    /// 带工具定义的入口：`tools` 是上层已格式化成 OpenAI/Ollama 兼容形状的
+    /// JSON tool spec。仍是考虑兼容的老路径（主要给 agent loop 的
+    /// `chat_with_tools` 分支用），返回结构化的 `ChatResponse`（携带
+    /// 工具调用列表 + token 用量）。
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -941,10 +1060,16 @@ impl ModelProvider for OllamaModelProvider {
         Ok(self.response_to_chat_response(response, &normalized_model))
     }
 
+    /// 是否支持原生工具协议。Ollama 走 prompt 引导，这里固定返回 `false`，
+    /// 运行时据此不会把工具以原生方式传给模型。
     fn supports_native_tools(&self) -> bool {
         false
     }
 
+    /// 当前主入口（新版 agent 循环走这里）：接受类型化 `ChatRequest`（消息 +
+    /// 工具 spec + 思考开关），因为本 provider 不支持原生工具协议，工具会先
+    /// 经 `with_prompt_guided_tool_instructions` 拼进 system prompt，再发请求，
+    /// 结果统一通过 `response_to_chat_response` 翻译成 `ChatResponse`。
     async fn chat(
         &self,
         request: zeroclaw_api::model_provider::ChatRequest<'_>,
@@ -969,6 +1094,8 @@ impl ModelProvider for OllamaModelProvider {
         Ok(self.response_to_chat_response(response, &normalized_model))
     }
 
+    /// 列出本 endpoint 上已安装的模型：调 Ollama 的 `GET /api/tags`。
+    /// 只有非本地 endpoint 才带 Bearer；本地 Ollama 无需鉴权。
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // Local Ollama's /api/tags lists installed models and requires no auth.
         // Remote Ollama endpoints attach the Bearer key; local ones don't.
