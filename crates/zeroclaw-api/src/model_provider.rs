@@ -1,3 +1,18 @@
+//! # ModelProvider（模型供应商）抽象层
+//!
+//! 定义 ZeroClaw 访问各家大模型供应商（Anthropic / OpenAI / Gemini / Ollama /
+//! OpenRouter / 各类兼容端点等）的行业中立抽象；各厂商 SDK 的具体实现位于
+//! `zeroclaw-providers` crate。
+//!
+//! 核心内容：
+//! - `ModelProvider` trait：供应商总接口（能力声明、普通 / 多轮 / 工具聊天、流式聊天）。
+//! - 消息载体：`ChatMessage`（对话消息）、`ChatRequest`（请求载荷）、`ChatResponse`
+//!   （响应：文字 + 工具调用 + 思考内容）、`ConversationMessage`（多轮会话消息）。
+//! - 流式类型：`StreamChunk` / `StreamEvent`（结构化事件，含原生工具调用信号）。
+//! - 能力与默认值：`ProviderCapabilities` 与 `BASELINE_*` 系列常量。
+//! - 扩展思考：`NativeThinkingParams` / `ThinkingDisplay`。
+//! - 工具协议：`ToolsPayload`（供应商原生格式或提示词引导文本）。
+
 use crate::tool::ToolSpec;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -5,13 +20,22 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
 
+// ── 扩展思考（extended thinking）参数 ─────────────────────────
+
+/// 扩展思考预算 token 上限。
 pub const MAX_BUDGET_TOKENS: u32 = 128_000;
 /// Anthropic's documented minimum for extended-thinking `budget_tokens`.
 /// Requests below this are rejected with 400 by the provider; clamping at
 /// resolution time gives a clearer error site than the first API call.
+///
+/// 中文：Anthropic 官方规定的 extended-thinking `budget_tokens` 下限；
+/// 低于该值的请求会被供应商以 400 拒绝，所以在解析阶段先夹紧，
+/// 比等到第一次 API 调用才暴露错误更清晰。
 pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 
 /// Parameters for native extended thinking support.
+/// 中文：原生「扩展思考」参数。`budget_tokens` 为思考预算；
+/// `display` 控制思考块在流式响应中以何种形式返回（见 `ThinkingDisplay`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeThinkingParams {
     pub budget_tokens: u32,
@@ -27,6 +51,9 @@ pub struct NativeThinkingParams {
 /// Anthropic's `thinking.display` request field (beta
 /// `thinking-display-updates-2026-08-18`), controlling whether thinking
 /// blocks come back omitted, as progress updates, or summarized.
+///
+/// 中文：`thinking.display` 字段的取值——思考块以哪种形式回流：
+/// `Omitted`（省略，即不返回）/ `Updates`（作为流式进度更新）/ `Summarized`（摘要）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingDisplay {
@@ -45,15 +72,23 @@ impl ThinkingDisplay {
     }
 }
 
+// ── 对话消息与上下文修剪 ─────────────────────────────────────
+
 /// A single message in a conversation.
+/// 中文：一条对话消息（`role` + `content` 极简模型）。
+/// 上下文过大被压缩时，会以 `PRUNED_*` 占位消息的形式留在历史里（见下方常量）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
 }
 
+/// 上下文修剪占位符：整段「工具调用 → 结果」被折叠成一条摘要的边界标记。
+/// 折叠摘要形如 `[Tool exchange: N tool call(s) — results collapsed]`。
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX: &str = "[Tool exchange:";
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX: &str = "results collapsed]";
+/// 上下文修剪的分隔占位：标记「上下文在这里继续」，防止被修剪掉的中间内容
+/// 与后续内容粘连（代理循环据此判断哪些占位条目可以安全丢弃）。
 pub const PRUNED_CONTEXT_SEPARATOR: &str = "[context continues]";
 
 impl ChatMessage {
@@ -129,6 +164,8 @@ impl ChatMessage {
         self.role == "user"
     }
 
+    /// 中文：修正「回合次序」——删除开头孤立出现的 assistant / tool 消息，
+    /// 保证非 system 消息序列以一条 `user` 消息打头，避免把残片历史发往供应商。
     pub fn sanitize_leading_turn_order(messages: &mut Vec<Self>) {
         let first_non_system = messages
             .iter()
@@ -144,7 +181,12 @@ impl ChatMessage {
     }
 }
 
+// ── 工具调用 / Token 用量 / 响应类型 ─────────────────────────
+
 /// A tool call requested by the LLM.
+/// 中文：模型请求的一次工具调用。`id` / `name` / `arguments`（JSON 字符串）；
+/// `extra_content` 为供应商特有的不透明扩展字段，必须在后续回合中原样回传
+/// （如 Gemini 3 的 `thought_signature`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -157,6 +199,9 @@ pub struct ToolCall {
     pub extra_content: Option<serde_json::Value>,
 }
 
+/// 中文：Token 用量统计。`input_tokens` 总提示长度（含缓存读写部分），
+/// `cached_input_tokens` 本次命中缓存的输入子集，`cache_creation_input_tokens`
+/// 本次写入缓存的输入子集（供应商按更贵的「缓存写入」费率计费）。
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
     /// Total prompt size: uncached + cached input tokens (including the
@@ -176,6 +221,8 @@ pub struct TokenUsage {
 }
 
 /// An LLM response that may contain text, tool calls, or both.
+/// 中文：模型响应。`text` 文字（工具调用型可能为空）、`tool_calls` 工具调用、
+/// `usage` 用量、`reasoning_content` 思考内容（不透明保留、需回传给供应商）。
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     /// Text content of the response (may be empty if only tool calls).
@@ -196,6 +243,10 @@ pub struct ChatResponse {
 /// The result has neither user-visible final text nor native tool calls.
 /// Reasoning is intentionally not part of this contract because it is opaque
 /// provider round-trip metadata rather than a final answer.
+///
+/// 中文：传输成功、但「语义上为空」的终态结果——既没有用户可见的最终文本，
+/// 也没有原生工具调用。思考内容被刻意排除在判定之外：它只是需回传给供应商的
+/// 不透明元数据，不是最终答案。用于把「空响应」表达为类型化错误而非成功返回。
 #[derive(Debug)]
 pub struct SemanticEmptyTerminalCompletion;
 
@@ -234,6 +285,10 @@ impl ChatResponse {
 ///
 /// An unclosed opening tag suppresses the remainder so partial reasoning never
 /// becomes final output.
+///
+/// 中文：在「终态响应判定 / 用户可见解析」前剥除内联的 ` thinking... response`
+/// 思考片段。注意若开头标签未闭合，则剩余内容全部被丢弃，保证半截思考
+/// 永远不会被当作最终输出。
 pub fn strip_think_tags(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
@@ -253,7 +308,10 @@ pub fn strip_think_tags(text: &str) -> String {
     result.trim().to_string()
 }
 
+// ── 请求 / 多轮会话类型 ──────────────────────────────────────
+
 /// Request payload for model_provider chat calls.
+/// 中文：非流式 chat 的请求载荷：消息列表 + 可选工具定义 + 可选扩展思考参数。
 #[derive(Debug, Clone, Copy)]
 pub struct ChatRequest<'a> {
     pub messages: &'a [ChatMessage],
@@ -274,6 +332,9 @@ pub struct ToolResultMessage {
 }
 
 /// A message in a multi-turn conversation, including tool interactions.
+/// 中文：多轮会话中的消息（serde tag 为 `type`）：
+/// `Chat`（普通文本消息）、`AssistantToolCalls`（助手发出工具调用，保留历史保真）、
+/// `ToolResults`（工具执行结果回喂给模型）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ConversationMessage {
@@ -291,7 +352,11 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
+// ── 流式类型（chunk / event / 选项 / 错误） ───────────────────
+
 /// A chunk of content from a streaming response.
+/// 中文：流式响应中的一个内容块：`delta` 文本增量、`reasoning` 思考增量、
+/// `is_final` 是否末块、`token_count` 每块 token 估算。
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
     /// Text delta for this chunk.
@@ -355,6 +420,14 @@ impl StreamChunk {
 /// Structured events emitted by model_provider streaming APIs.
 /// This extends plain text chunk streaming with explicit tool-call signals so
 /// agent loops can preserve native tool semantics without parsing payload text.
+///
+/// 中文：流式 API 的结构化事件流，相比纯文本增量多了明确的工具调用信号，
+/// 让代理循环无需解析正文即可保留原生工具语义：
+/// - `TextDelta` / `ThinkingDelta`：文本增量与思考进度（思考进度仅用于展示，不持久化）；
+/// - `ReasoningFinalized`：可回放的最终思考块（追加到 `reasoning_content` 回传）；
+/// - `ToolCall` / `PreExecutedToolCall` / `PreExecutedToolResult`：工具调用信号
+///   （`PreExecuted*` 为供应商已自行执行的，仅作观测、不再被调度器执行）；
+/// - `Usage`（通常出现在 `Final` 之前）/ `Final`。
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// Text delta from the assistant.
@@ -427,6 +500,11 @@ pub type StreamResult<T> = std::result::Result<T, StreamError>;
 /// typed cause so reliability and turn accounting can bill that work without
 /// treating it as accepted-response context usage. `category` is diagnostic
 /// metadata only and must not be rendered to users.
+///
+/// 中文：供应商（Anthropic）因安全分类器拒答的类型化错误。
+/// 每次「被拒尝试」自带的用量随类型保留，供计费 / 可靠性统计入账；
+/// `attempted_candidate_index` 用于在复合供应商的故障转移域内定位
+/// 已结算过的那条候选，供非流式恢复路径精确跳过。
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("anthropic refusal: model declined this request (safety classifiers)")]
 pub struct ModelRefusalError {
@@ -471,6 +549,8 @@ pub enum StreamError {
     Io(#[from] std::io::Error),
 }
 
+// ── 能力声明 / 基线默认 / 定价模型 ───────────────────────────
+
 /// Structured error returned when a requested capability is not supported.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error(
@@ -485,6 +565,9 @@ pub struct ProviderCapabilityError {
 /// ModelProvider capabilities declaration.
 /// Describes what features a model_provider supports, enabling intelligent
 /// adaptation of tool calling modes and request formatting.
+///
+/// 中文：供应商能力声明（默认全为不支持/`false`）：原生工具调用、视觉输入、
+/// 提示词缓存、原生扩展思考。调用方据此调整工具调用模式与请求格式。
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderCapabilities {
@@ -499,6 +582,9 @@ pub struct ProviderCapabilities {
 }
 
 /// ModelProvider-specific tool payload formats.
+/// 中文：工具定义的供应商原生格式：Gemini `functionDeclarations`、
+/// Anthropic `tools`（带 input_schema）、OpenAI `tools`（带 function）、
+/// 以及 `PromptGuided`（把工具说明以文本注入 system 提示词的兜底方案）。
 #[derive(Debug, Clone)]
 pub enum ToolsPayload {
     /// Gemini API format (functionDeclarations).
@@ -513,26 +599,38 @@ pub enum ToolsPayload {
     PromptGuided { instructions: String },
 }
 
+// ── 基线默认值（供应商不声明时使用） ──────────────────────────
+
 /// Industry-neutral sampling temperature. OpenAI, Gemini, OpenRouter, and
 /// most OpenAI-compatible endpoints document 0.7 as their typical default;
 /// Anthropic and Ollama override (1.0 and 0.0 respectively).
+///
+/// 中文：行业中立的采样温度基线 0.7（OpenAI / Gemini / OpenRouter 等默认值；
+/// Anthropic 用 1.0、Ollama 用 0.0，各自覆盖）。
 pub const BASELINE_TEMPERATURE: f64 = 0.7;
 
 /// Output-token budget roomy enough for typical agent turns. Providers
 /// override per family where the model's own context window is the
 /// binding constraint.
+/// 中文：单轮输出 token 预算基线 4096；上下文窗口更紧的模型家族会各自覆盖。
 pub const BASELINE_MAX_TOKENS: u32 = 4096;
 
 /// HTTP timeout for cloud inference. Local model_providers (Ollama) override
 /// upward since CPU/GPU-bound inference runs slower than round-tripping to
 /// a hyperscaler.
+/// 中文：云端推理 HTTP 超时基线 120s；本地供应商（如 Ollama）会调高，
+/// 因为 CPU/GPU 推理比往返远端更慢。
 pub const BASELINE_TIMEOUT_SECS: u64 = 120;
 
 /// Wire protocol used when the model_provider doesn't declare one. Only OpenAI's
 /// Codex stack uses the "responses" protocol; everything else speaks the
 /// classic chat completions shape.
+/// 中文：未声明时的线上协议基线 `chat_completions`；仅 OpenAI Codex 系用 `responses`。
 pub const BASELINE_WIRE_API: &str = "chat_completions";
 
+/// 中文：模型按 token 计费单价（USD/token，字符串保留小数精度）。
+/// `prompt` 输入 / `completion` 输出 / `input_cache_read` 读取缓存 /
+/// `input_cache_write` 写入缓存（后两者为 Kilo Gateway 专有）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelPricing {
     /// Input/prompt tokens per-token rate (USD per token, e.g. `"0.000005"` = $5/1M tokens).
@@ -552,6 +650,8 @@ pub struct ModelPricing {
 }
 
 /// Model info with optional pricing — returned by `list_models_with_pricing`.
+/// 中文：模型信息，可选携带定价；`context_window` 未知时必须保持 `None`
+/// （禁止擅自填默认值，好让运维看到「未设置」而非假值）。
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInfo {
     pub id: String,
@@ -565,6 +665,21 @@ pub struct ModelInfo {
     pub context_window: Option<usize>,
 }
 
+// ── ModelProvider trait（供应商总接口） ────────────────────────
+
+/// 中文：供应商必须实现的总接口。方法按能力分组，绝大多数带默认实现，
+/// 只有 `chat_with_system` 为必选：
+/// - 能力声明：`capabilities` / `capabilities_for_model` / `supports_native_tools` /
+///   `supports_vision` / `supports_streaming` 等。
+/// - 聊天入口（自简到繁）：`simple_chat`（单轮）→ `chat_with_system`（带系统提示，必选）→
+///   `chat_with_history`（多轮）→ `chat`（结构化；供应商标称不支持原生工具时
+///   自动把工具说明以 `PromptGuided` 方式注入 system 消息）。
+/// - 流式：`stream_chat` / `stream_chat_with_history` / `stream_chat_with_system`
+///   （默认返回空流）。
+/// - 默认值：`default_temperature` / `default_max_tokens` / `default_timeout_secs` /
+///   `default_base_url` / `default_wire_api`（对应 `BASELINE_*`）。
+/// - `has_stable_request_identity` 默认 `false`（承认「不稳定」），身份敏感功能
+///   （如持久全量响应缓存）据此 fail-closed。
 #[async_trait]
 pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// Whether repeated requests for `model` are dispatched to one stable
@@ -878,6 +993,9 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 /// Blanket implementation: `Arc<T>` delegates all `ModelProvider` methods to `T`.
 /// This eliminates the need for manual `impl ModelProvider for Arc<MyModelProvider>`
 /// boilerplate in test and production code.
+///
+/// 中文：对所有 `Arc<T>` 的统一定向委托实现——`Arc<MyModelProvider>` 直接当作
+/// `ModelProvider` 使用，免去测试与生产中手写样板转发方法。
 #[async_trait]
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
     fn has_stable_request_identity(&self, model: &str) -> bool {
@@ -1024,6 +1142,9 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 }
 
 /// Build tool instructions text for prompt-guided tool calling.
+/// 中文：为「提示词引导式」工具调用生成说明文本：教模型用
+/// `<tool_call>{"name":..., "arguments":{...}}</tool_call>` 包裹工具调用，
+/// 并把每个工具的 JSON Schema 参数拼进 system 提示词。
 pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     let mut instructions = String::new();
 
@@ -1051,6 +1172,8 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 
     instructions
 }
+
+// ── 单元测试 ─────────────────────────────────────────────────
 
 #[cfg(test)]
 mod capability_tests {

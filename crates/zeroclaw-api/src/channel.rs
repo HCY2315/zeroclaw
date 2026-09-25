@@ -1,3 +1,17 @@
+//! # Channel（渠道）抽象层
+//!
+//! 「渠道」是运行时与各消息平台（Telegram / Discord / Slack / 飞书 / 邮件 / WebSocket /
+//! Matrix 等）之间的统一抽象。本文件只定义**类型与 trait**，不包含任何平台 SDK 绑定；
+//! 各平台的具体实现位于 `zeroclaw-channels` crate。
+//!
+//! 主要内容：
+//! - `Channel` trait：渠道的总接口（发送 / 监听 / 审批 / 草稿流式 / 模型选择器等）。
+//! - 消息载体：`ChannelMessage`（入站）、`SendMessage`（出站，含线程 / 附件 / TTS）。
+//! - 审批类型：`ChannelApproval*` 与 `AttributedApprovalResponse`（携带 `ApprovalSource`，
+//!   区分「真人确实拒绝」与「运行时 fail-closed」，避免模型误以为有人否决）。
+//! - 门控卡片：`ChannelGatePrompt` / `GateChoice`，长驻式（非阻塞等待）审批提示。
+//! - SOP 集成：`ChannelSopTopic` 是渠道-SOP 事件主题 `channel.alias:event_type` 语法的唯一来源。
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
@@ -5,11 +19,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::media::MediaAttachment;
 
+// ── SOP 事件主题语法 ──────────────────────────────────────────
+
 /// Reserved `ChannelMessage.subject` prefix the git/forge channel uses to
 /// label SOP-ingress events. Routing is NOT keyed on this (see
 /// `ChannelMessage::internal_sop_event`); it exists so channels that fill
 /// `subject` from user-controlled data (email) can keep this reserved
 /// namespace out of inbound subjects.
+///
+/// 中文：git/forge 渠道用来给「SOP 入站事件」在 subject 上打标记的前缀。
+/// 路由**不依赖**该前缀（真正依据 `internal_sop_event` 字段）；它只用于守住这块
+/// 保留命名空间，避免由用户可控字段（如邮件 subject）混入。
 pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
 
 /// The single authority for the channel-SOP event topic grammar
@@ -21,6 +41,11 @@ pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
 /// `channel.alias` head with `:`. A bare `channel` (no alias, no event type)
 /// and the `channel/alias` message form are both accepted by `parse` so the
 /// same matcher serves agent-loop message triggers and forge event triggers.
+///
+/// 中文：渠道-SOP 事件主题 `channel.alias:event_type` 语法的**单一权威**：
+/// - `.` 分隔 channel 与 alias，`:` 分隔 head 与 event_type；
+/// - `build` 在此构造主题（生产侧），`parse` 在此解析（消费侧），语法只存在一处，两侧不会漂移；
+/// - 另接受消息形式 `channel` 与 `channel/alias`，让同一匹配器同时服务消息触发与 forge 事件触发。
 pub struct ChannelSopTopic;
 
 impl ChannelSopTopic {
@@ -57,7 +82,7 @@ impl ChannelSopTopic {
     }
 }
 
-// ── Channel approval types ──────────────────────────────────────
+// ── 审批相关类型（Channel approval types） ─────────────────────
 
 /// Where a tool call sits in the batch the model issued for one turn.
 ///
@@ -234,6 +259,8 @@ impl AttributedApprovalResponse {
     }
 }
 
+// ── 门控（gate）审批卡片类型 ─────────────────────────────────
+
 /// A long-lived, channel-agnostic gate prompt (e.g. a parked SOP approval):
 /// rendered natively per channel (Discord embed + buttons, Telegram inline
 /// keyboard, ...), answered through the channel's normal inbound path — a
@@ -348,6 +375,8 @@ pub enum GateChoiceEmphasis {
     Neutral,
 }
 
+// ── 入站 / 出站消息类型 ──────────────────────────────────────
+
 /// Conversation history scope for an inbound channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelConversationScope {
@@ -359,6 +388,11 @@ pub enum ChannelConversationScope {
 }
 
 /// A message received from or sent to a channel
+/// 中文：一条流经渠道的消息载体，入站（received）与出站（sent）方向复用同一结构。
+/// 关键字段：`id`（消息 ID）、`sender`（显示名）、`platform_sender_id`（平台不可变 ID）、
+/// `reply_target`（回信目标，如房间/邮箱）、`channel_alias`（多实例别名，参与会话键构造）、
+/// `thread_ts`（线程锚点）、`attachments`（媒体附件）、`internal_sop_event`
+/// （仅 forge 渠道写入的 SOP 路由标记，不参与 serde 序列化）。
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
     pub id: String,
@@ -411,6 +445,10 @@ pub struct ChannelMessage {
 }
 
 /// Message to send through a channel
+/// 中文：要通过渠道发出的消息，面向「发」语义：
+/// `recipient`（接收方）、`in_reply_to` / `references`（邮件回复链）、`thread_ts`（线程回复）、
+/// `cancellation_token`（可中断投递）、`attachments`（附件，不支持的渠道忽略）、
+/// `suppress_voice` / `force_voice`（TTS 声道控制，`suppress_voice` 优先）。
 #[derive(Debug, Clone)]
 pub struct SendMessage {
     pub content: String,
@@ -436,6 +474,8 @@ pub struct SendMessage {
     /// Ignored when `suppress_voice` is also `true`.
     pub force_voice: bool,
 }
+
+// ── 房间 / 生命周期进度类型 ──────────────────────────────────
 
 /// Cross-channel room visibility used by room-management APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,6 +704,8 @@ impl SendMessage {
     }
 }
 
+// ── Forge API 透传请求 / 响应类型 ─────────────────────────────
+
 /// A low-level, provider-relative forge API request routed through a
 /// forge-backed channel. Channel-neutral so the `Channel` trait carries no
 /// forge-specific types; the git channel maps this onto its provider's
@@ -685,6 +727,8 @@ pub struct ForgeApiResponse {
     pub status: u16,
     pub body: serde_json::Value,
 }
+
+// ── 渠道原生模型选择器类型 ───────────────────────────────────
 
 /// Runtime-owned state needed by a channel to present its native model picker.
 ///
@@ -743,6 +787,8 @@ pub struct ChannelModelPickerRoute {
     pub model: String,
 }
 
+// ── 监听健康状态 ─────────────────────────────────────────────
+
 /// What a channel can say about its own listener without performing any I/O.
 ///
 /// See [`Channel::listener_health`]. The three states exist because a listener
@@ -764,11 +810,26 @@ pub enum ListenerHealth {
     Unhealthy,
 }
 
+// ── Channel trait（渠道总接口） ─────────────────────────────────
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
 /// `attribution_span!(&*ch)` so log emissions from within `listen()` /
 /// `send()` inherit `channel = <type>.<alias>`.
+///
+/// 中文：本 trait 的方法按能力分组，多数提供默认实现，只有少数为必选。
+/// - **必选**：`name` / `send` / `listen`。
+/// - 多消息流式（草稿编辑）：`supports_multi_message_streaming` + `send_draft` /
+///   `update_draft` / `update_draft_progress` / `finalize_draft` / `cancel_draft`。
+/// - 人审 / 门控：`request_approval` / `request_approval_attributed` /
+///   `send_gate_prompt` / `finalize_gate_prompt` / `request_choice` / `request_multi_choice`。
+///   惯例：真实实现放在 `*_attributed` 里，普通版本委托过去，逻辑只写一处。
+/// - 健康与自环防护：`health_check`（主动探活，可随时调用）/ `listener_health`
+///   （被动采样，适合定时器复用）/ `self_handle` + `drop_self_messages`
+///   （防止机器人回复自己的消息）。
+/// - 房间管理：`create_room` / `invite_user`（默认直接报错，表示不支持）。
+/// - 模型选择器：`present_model_picker`（默认返回 `Ok(false)`，回退到文本命令 `/model`）。
 #[async_trait]
 pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Human-readable channel name
@@ -1248,6 +1309,8 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         true
     }
 }
+
+// ── 单元测试 ─────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
