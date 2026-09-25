@@ -872,6 +872,10 @@ pub struct LarkChannel {
     /// via [`Self::with_streaming`].
     draft_update_interval_ms: u64,
     last_draft_edit: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+    /// 话题背景上下文缓存，键为飞书话题 ID（`omt_...`）。每个话题首次收到
+    /// 消息时拉取一次历史，之后复用缓存避免反复调接口；会话延续性由
+    /// orchestrator 按「人 + 话题」的历史键保证。
+    topic_contexts: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -1273,6 +1277,7 @@ impl LarkChannel {
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            topic_contexts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             // =============================================================================
             // 单元测试：以下全部为 #[cfg(test)]，覆盖 URL 构造、鉴权、卡片、消息解析、
             // token 刷新、审批回调与媒体上传发送等路径，不参与生产编译。
@@ -1307,6 +1312,7 @@ impl LarkChannel {
         ch.encrypt_key = config.encrypt_key.clone();
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
+        ch.per_user_session = config.per_user_session;
         ch
     }
 
@@ -1898,6 +1904,7 @@ impl LarkChannel {
                         } else {
                             None
                         };
+                    let thread_id = lark_msg.thread_id.as_deref();
 
                     let mut channel_msg = ChannelMessage {
                         id: lark_msg.message_id.clone(),
@@ -1918,7 +1925,8 @@ impl LarkChannel {
                         subject: None,
 
                         ..Default::default()};
-                    Self::fill_topic_fields(&mut channel_msg, topic_anchor);
+                    self.apply_topic_annotation(&mut channel_msg, topic_anchor, thread_id)
+                        .await;
 
                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: message in {}", lark_msg.chat_id));
                     if tx.send(channel_msg).await.is_err() { break; }
@@ -2596,6 +2604,9 @@ impl LarkChannel {
         let topic_anchor = payload
             .pointer("/event/message")
             .and_then(Self::lark_message_topic_anchor);
+        let thread_id = payload
+            .pointer("/event/message/thread_id")
+            .and_then(|t| t.as_str());
 
         let mut channel_msg = ChannelMessage {
             id: message_id.to_string(),
@@ -2612,7 +2623,8 @@ impl LarkChannel {
 
             ..Default::default()
         };
-        Self::fill_topic_fields(&mut channel_msg, topic_anchor);
+        self.apply_topic_annotation(&mut channel_msg, topic_anchor, thread_id)
+            .await;
 
         vec![channel_msg]
     }
@@ -2831,12 +2843,250 @@ impl LarkChannel {
             .map(String::from)
     }
 
-    /// 填充消息的话题字段：话题消息按「人 + 话题」隔离会话历史与中断范围，
-    /// 并且 orchestrator 会把回复的发回锚点（thread_ts）带到出站消息上。
-    fn fill_topic_fields(msg: &mut ChannelMessage, anchor: Option<String>) {
+    /// 处理话题消息：既负责「人 + 话题」会话隔离（thread_ts / interruption_scope_id），
+    /// 又在该话题首次出现时拉取话题历史作为背景上下文注入内容，使机器人能针对整个
+    /// 话题作答。拉取失败静默放行（仅记日志），不阻塞消息处理；缓存命中则跳过注入，
+    /// 会话延续性由 orchestrator 的历史键保证。
+    async fn apply_topic_annotation(
+        &self,
+        msg: &mut ChannelMessage,
+        anchor: Option<String>,
+        thread_id: Option<&str>,
+    ) {
         if let Some(anchor) = anchor {
             msg.thread_ts = Some(anchor.clone());
             msg.interruption_scope_id = Some(anchor);
+        }
+        let Some(tid) = thread_id.filter(|t| !t.is_empty()) else {
+            return;
+        };
+        if msg.content.trim().is_empty() || self.topic_contexts.read().await.contains_key(tid) {
+            return;
+        }
+        // 首次遇到该话题才拉取历史并注入背景；缓存命中表示已补齐过，之后的会话
+        // 延续交给 orchestrator 的「人 + 话题」历史键，避免每条消息都重复携带背景。
+        if let Some(context) = self.fetch_topic_history(tid).await {
+            self.topic_contexts
+                .write()
+                .await
+                .insert(tid.to_string(), context.clone());
+            msg.content = format!(
+                "【话题背景】以下是该话题此前消息，供参考上下文：\n{context}\n---\n{}",
+                msg.content
+            );
+        }
+    }
+
+    /// 分页拉取话题内全部历史消息（`container_id_type=thread`），保留最近的一批
+    /// 作为上下文。`thread` 容器暂不支持时间范围过滤，只能顺序分页。
+    async fn fetch_topic_history(&self, thread_id: &str) -> Option<String> {
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{e}"), "thread_id": thread_id})
+                        ),
+                    "topic history: failed to get tenant token"
+                );
+                return None;
+            }
+        };
+
+        const MAX_PAGES: usize = 3;
+        const KEEP_RECENT: usize = 60;
+        let client = self.http_client();
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut page_token = String::new();
+        let mut pages = 0usize;
+
+        loop {
+            let url = if page_token.is_empty() {
+                format!(
+                    "{}/im/v1/messages?container_id_type=thread&container_id={}&page_size=50&sort_type=ByCreateTimeAsc",
+                    self.api_base(),
+                    thread_id,
+                )
+            } else {
+                format!(
+                    "{}/im/v1/messages?container_id_type=thread&container_id={}&page_size=50&sort_type=ByCreateTimeAsc&page_token={}",
+                    self.api_base(),
+                    thread_id,
+                    page_token,
+                )
+            };
+
+            let resp = match client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{e}"), "thread_id": thread_id})
+                            ),
+                        "topic history: request failed"
+                    );
+                    return None;
+                }
+            };
+
+            let status = resp.status();
+            let body: serde_json::Value = match resp.json().await {
+                Ok(b) => b,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{e}"), "thread_id": thread_id})
+                            ),
+                        "topic history: invalid response body"
+                    );
+                    return None;
+                }
+            };
+
+            let code = body.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            if !status.is_success() || code != 0 {
+                let api_msg = body
+                    .get("msg")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "thread_id": thread_id,
+                            "code": code,
+                            "msg": api_msg,
+                            "error_key": "lark.topic_history.fetch_failed",
+                        })),
+                    "topic history: fetch failed"
+                );
+                return None;
+            }
+
+            if let Some(batch) = body.pointer("/data/items").and_then(|i| i.as_array()) {
+                items.extend(batch.iter().cloned());
+            }
+
+            let has_more = body
+                .pointer("/data/has_more")
+                .and_then(|h| h.as_bool())
+                .unwrap_or(false);
+            let next_token = body
+                .pointer("/data/page_token")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            pages += 1;
+            if !has_more || next_token.is_empty() || pages >= MAX_PAGES {
+                break;
+            }
+            page_token = next_token;
+        }
+
+        if items.is_empty() {
+            return None;
+        }
+        let start = items.len().saturating_sub(KEEP_RECENT);
+        let lines: Vec<String> = items[start..]
+            .iter()
+            .map(Self::lark_topic_history_line)
+            .collect();
+        Some(lines.join("\n"))
+    }
+
+    /// 把一条历史消息拉平成「发送方 + 文本」一行，用于注入上下文。
+    fn lark_topic_history_line(item: &serde_json::Value) -> String {
+        let msg_type = item
+            .pointer("/msg_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let sender_raw = item
+            .pointer("/sender/sender_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user");
+        let sender = if sender_raw == "app" {
+            "bot".to_string()
+        } else {
+            match item
+                .pointer("/sender/id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                Some(id) => format!("user({id})"),
+                None => "user".to_string(),
+            }
+        };
+        let text = item
+            .pointer("/body/content")
+            .and_then(|c| c.as_str())
+            .and_then(Self::lark_topic_history_text);
+        match text {
+            Some(t) => format!("- {sender}: {t}"),
+            None => format!("- {sender}: [{msg_type}]"),
+        }
+    }
+
+    /// 从消息 content JSON 里提取可读文本：`text` 消息直接取 `text` 字段；
+    /// post / 交互卡片递归收集所有 `text` 片段（限长，避免超大 post 灌爆上下文）。
+    fn lark_topic_history_text(content: &str) -> Option<String> {
+        let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
+        if let Some(t) = parsed
+            .get("text")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.trim().is_empty())
+        {
+            return Some(t.to_string());
+        }
+        let mut parts: Vec<String> = Vec::new();
+        Self::lark_collect_text_fragments(&parsed, &mut parts, 0);
+        if parts.is_empty() {
+            return None;
+        }
+        let parts: Vec<String> = parts.into_iter().map(|p| p.trim().to_string()).collect();
+        let joined = parts.join(" ");
+        Some(joined.chars().take(240).collect())
+    }
+
+    /// 递归收集 JSON 里所有的 `text` 字符串字段（深度受限，防病态嵌套）。
+    fn lark_collect_text_fragments(value: &serde_json::Value, out: &mut Vec<String>, depth: usize) {
+        if depth > 6 {
+            return;
+        }
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(t) = map
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .filter(|t| !t.trim().is_empty())
+                {
+                    out.push(t.to_string());
+                } else {
+                    for v in map.values() {
+                        Self::lark_collect_text_fragments(v, out, depth + 1);
+                    }
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr {
+                    Self::lark_collect_text_fragments(v, out, depth + 1);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3074,6 +3324,7 @@ impl LarkChannel {
         let topic_anchor = event
             .pointer("/message")
             .and_then(Self::lark_message_topic_anchor);
+        let thread_id = event.pointer("/message/thread_id").and_then(|t| t.as_str());
 
         let mut channel_msg = ChannelMessage {
             id: evt_message_id.to_string(),
@@ -3090,7 +3341,8 @@ impl LarkChannel {
 
             ..Default::default()
         };
-        Self::fill_topic_fields(&mut channel_msg, topic_anchor);
+        self.apply_topic_annotation(&mut channel_msg, topic_anchor, thread_id)
+            .await;
         messages.push(channel_msg);
 
         messages
@@ -4626,6 +4878,42 @@ mod tests {
         make_channel_with_peers(vec!["ou_testuser123".into()])
     }
 
+    /// 组装一个指向本地 mock 的渠道：token 请求 + 返回空话题历史的
+    /// `GET /im/v1/messages`。用于在不依赖真实网络的前提下跑解析类测试。
+    async fn make_channel_with_mock_empty_topic_history(
+        server: &wiremock::MockServer,
+    ) -> LarkChannel {
+        mount_lark_tenant_token(server).await;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let _list_mock = Mock::given(method("GET"))
+            .and(path("/im/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "has_more": false, "items": [] }
+            })))
+            .mount(server)
+            .await;
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+        ch
+    }
+
+    /// 挂一个租户 token 获取接口的 mock（POST /auth/v3/tenant_access_token/internal）。
+    async fn mount_lark_tenant_token(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-topic",
+                "expire": 7200
+            })))
+            .mount(server)
+            .await;
+    }
+
     async fn post_lark_challenge(
         verification_token: &str,
         payload: serde_json::Value,
@@ -5200,7 +5488,8 @@ mod tests {
 
     #[tokio::test]
     async fn lark_parse_thread_message_fills_topic_fields() {
-        let ch = make_channel();
+        let server = wiremock::MockServer::start().await;
+        let ch = make_channel_with_mock_empty_topic_history(&server).await;
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
             "event": {
@@ -5231,7 +5520,8 @@ mod tests {
 
     #[tokio::test]
     async fn lark_parse_plain_message_leaves_topic_fields_empty() {
-        let ch = make_channel();
+        let server = wiremock::MockServer::start().await;
+        let ch = make_channel_with_mock_empty_topic_history(&server).await;
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
             "event": {
@@ -5253,6 +5543,220 @@ mod tests {
         assert_eq!(msgs[0].content, "plain ping");
         assert!(msgs[0].thread_ts.is_none());
         assert!(msgs[0].interruption_scope_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn lark_parse_thread_message_injects_topic_history_background() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_lark_tenant_token(&server).await;
+
+        let list_mock = Mock::given(method("GET"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("container_id_type", "thread"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "code": 0,
+                    "data": {
+                        "has_more": false,
+                        "items": [
+                            {
+                                "message_id": "om_old1",
+                                "root_id": "om_root_message123",
+                                "thread_id": "omt_d4be107c616a",
+                                "msg_type": "text",
+                                "sender": { "id": "ou_old_user", "id_type": "open_id", "sender_type": "user" },
+                                "body": { "content": "{\"text\":\"earlier discussion\"}" }
+                            },
+                            {
+                                "message_id": "om_old2",
+                                "root_id": "om_root_message123",
+                                "thread_id": "omt_d4be107c616a",
+                                "msg_type": "text",
+                                "sender": { "id": "ou_bot", "id_type": "open_id", "sender_type": "app" },
+                                "body": { "content": "{\"text\":\"bot earlier reply\"}" }
+                            }
+                        ]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        let thread_payload = |message_id: &str, content: &str| {
+            serde_json::json!({
+                "header": { "event_type": "im.message.receive_v1" },
+                "event": {
+                    "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                    "message": {
+                        "message_id": message_id,
+                        "message_type": "text",
+                        "content": content,
+                        "chat_id": "oc_chat123",
+                        "chat_type": "group",
+                        "create_time": "1699999999000",
+                        "mentions": [{ "id": { "open_id": "ou_bot" } }],
+                        "thread_id": "omt_d4be107c616a",
+                        "root_id": "om_root_message123"
+                    }
+                }
+            })
+        };
+
+        let first = ch
+            .parse_event_payload(&thread_payload("om_followup1", "{\"text\":\"topic ping\"}"))
+            .await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].thread_ts.as_deref(), Some("om_root_message123"));
+        let content = first[0].content.clone();
+        assert!(
+            content.contains("【话题背景】"),
+            "first topic message should carry fetched background, got: {content}"
+        );
+        assert!(
+            content.contains("- user(ou_old_user): earlier discussion"),
+            "background should include user history line, got: {content}"
+        );
+        assert!(
+            content.contains("- bot: bot earlier reply"),
+            "background should include bot history line, got: {content}"
+        );
+        assert!(content.ends_with("topic ping"));
+
+        let second = ch
+            .parse_event_payload(&thread_payload(
+                "om_followup2",
+                "{\"text\":\"topic again\"}",
+            ))
+            .await;
+        assert_eq!(second[0].content, "topic again");
+        drop(list_mock);
+    }
+
+    #[tokio::test]
+    async fn lark_fetch_topic_history_paginates_and_annotates_line() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_lark_tenant_token(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("container_id_type", "thread"))
+            .and(query_param_is_missing("page_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "has_more": true,
+                    "page_token": "tok_page2",
+                    "items": [{
+                        "message_id": "om_p1",
+                        "msg_type": "text",
+                        "sender": { "id": "ou_a", "id_type": "open_id", "sender_type": "user" },
+                        "body": { "content": "{\"text\":\"page one\"}" }
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("page_token", "tok_page2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "has_more": false,
+                    "items": [{
+                        "message_id": "om_p2",
+                        "msg_type": "text",
+                        "sender": { "id": "ou_b", "id_type": "open_id", "sender_type": "user" },
+                        "body": { "content": "{\"text\":\"page two\"}" }
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        let context = ch
+            .fetch_topic_history("omt_paged")
+            .await
+            .expect("paged history");
+        assert!(context.contains("- user(ou_a): page one"));
+        assert!(context.contains("- user(ou_b): page two"));
+    }
+
+    #[tokio::test]
+    async fn lark_apply_topic_annotation_skips_injection_when_cached() {
+        let ch = make_channel();
+        ch.topic_contexts.write().await.insert(
+            "omt_cached".to_string(),
+            "cached topic background".to_string(),
+        );
+
+        let mut msg = ChannelMessage {
+            id: "om_cached_msg".into(),
+            sender: "ou_testuser123".into(),
+            reply_target: "oc_chat123".into(),
+            content: "a question in the topic".into(),
+            channel: "lark".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            ..Default::default()
+        };
+
+        ch.apply_topic_annotation(&mut msg, Some("om_root_cached".into()), Some("omt_cached"))
+            .await;
+
+        assert_eq!(msg.thread_ts.as_deref(), Some("om_root_cached"));
+        assert_eq!(msg.interruption_scope_id.as_deref(), Some("om_root_cached"));
+        assert_eq!(
+            msg.content, "a question in the topic",
+            "cached thread must not re-inject the background onto later messages"
+        );
+    }
+
+    #[test]
+    fn lark_topic_history_line_formats_text_and_post() {
+        let text_item = serde_json::json!({
+            "msg_type": "text",
+            "sender": { "id": "ou_x", "id_type": "open_id", "sender_type": "user" },
+            "body": { "content": "{\"text\":\"hello\"}" }
+        });
+        assert_eq!(
+            LarkChannel::lark_topic_history_line(&text_item),
+            "- user(ou_x): hello"
+        );
+
+        let post_item = serde_json::json!({
+            "msg_type": "post",
+            "sender": { "id": "ou_bot", "id_type": "open_id", "sender_type": "app" },
+            "body": { "content": "{\"zh_cn\":{\"title\":\"t\",\"content\":[[{\"tag\":\"text\",\"text\":\"rich \"},{\"tag\":\"text\",\"text\":\"text\"}]]}}" }
+        });
+        assert_eq!(
+            LarkChannel::lark_topic_history_line(&post_item),
+            "- bot: rich text"
+        );
+
+        let sticker_item = serde_json::json!({
+            "msg_type": "sticker",
+            "sender": { "id": "ou_z", "id_type": "open_id", "sender_type": "user" },
+            "body": { "content": "{}" }
+        });
+        assert_eq!(
+            LarkChannel::lark_topic_history_line(&sticker_item),
+            "- user(ou_z): [sticker]"
+        );
     }
 
     #[test]
