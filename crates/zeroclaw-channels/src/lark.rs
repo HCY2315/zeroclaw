@@ -1914,14 +1914,14 @@ impl LarkChannel {
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: self.channel_name().to_string(),
-            channel_alias: Some(self.alias.clone()),
+                        channel_alias: Some(self.alias.clone()),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
                         interruption_scope_id: None,
-                    attachments: vec![],
+                        attachments: vec![],
                         subject: None,
 
                         ..Default::default()};
@@ -2863,18 +2863,18 @@ impl LarkChannel {
         if msg.content.trim().is_empty() || self.topic_contexts.read().await.contains_key(tid) {
             return;
         }
-        // 首次遇到该话题才拉取历史并注入背景；缓存命中表示已补齐过，之后的会话
-        // 延续交给 orchestrator 的「人 + 话题」历史键，避免每条消息都重复携带背景。
-        if let Some(context) = self.fetch_topic_history(tid).await {
-            self.topic_contexts
-                .write()
-                .await
-                .insert(tid.to_string(), context.clone());
-            msg.content = format!(
-                "【话题背景】以下是该话题此前消息，供参考上下文：\n{context}\n---\n{}",
-                msg.content
-            );
-        }
+        // // 首次遇到该话题才拉取历史并注入背景；缓存命中表示已补齐过，之后的会话
+        // // 延续交给 orchestrator 的「人 + 话题」历史键，避免每条消息都重复携带背景。
+        // if let Some(context) = self.fetch_topic_history(tid).await {
+        //     self.topic_contexts
+        //         .write()
+        //         .await
+        //         .insert(tid.to_string(), context.clone());
+        //     msg.content = format!(
+        //         "【话题背景】以下是该话题此前消息，供参考上下文：\n{context}\n---\n{}",
+        //         msg.content
+        //     );
+        // }
     }
 
     /// 分页拉取话题内全部历史消息（`container_id_type=thread`），保留最近的一批
