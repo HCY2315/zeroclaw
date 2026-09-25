@@ -1,3 +1,31 @@
+//! 飞书 / Lark 渠道实现（一个文件同时服务飞书与 Lark 国际版）。
+//!
+//! 运行时通过实现 `zeroclaw_api::channel::Channel` trait，把飞书/Lark 消息
+//! 桥接到 agent 主循环。核心能力：
+//!
+//! - **双接收模式**：`listen()` 根据配置选择 `LarkReceiveMode::Websocket`
+//!   （飞书长连接 `pbbp2.proto` 帧协议，推荐）或 `LarkReceiveMode::Webhook`
+//!   （HTTP 事件回调，需公网端口）。
+//! - **入站消息解析**：`parse_event_payload_async` / `parse_event_payload` 把
+//!   `im.message.receive_v1` 事件转成 `ChannelMessage`，支持 text / post（富文本，
+//!   含 @mention 提取）/ image / file / audio（走转录）/ list 多种消息类型；
+//!   群聊下只有被 @机器人 时才响应（`mention_only` 配置 + allowlist 白名单）。
+//! - **出站发送**：文本走**可交互 Markdown 卡片**（Card JSON 2.0，自动按
+//!   28 KB 上限分块），`[IMAGE:...]` / `[FILE:...]` 等媒体 marker 会被解析、
+//!   校验路径（必须落在 workspace_dir 内）、上传后以图片/文件消息发出。
+//! - **审批卡片**：`request_approval` 发送带 ✅/❌/✅✅ 三个按钮的审批卡，
+//!   用户点击由 `handle_card_action_event` 收口，通过 oneshot 唤醒等待方，
+//!   并把卡片 PATCH 成已决状态；超时/取消合成带来源（`TimedOut`/`Unreachable`）
+//!   的拒绝，避免把机器人自判的拒绝误报成"用户拒绝"。
+//! - **流式草稿**：`StreamMode::Partial` 下先发占位卡，再用 PATCH 每次增量更新，
+//!   受 `draft_update_interval_ms` 限速（适配飞书每消息 5 QPS 上限）。
+//! - **表情回应（ack）**：收到消息后自动打 👀，处理完换成 ✅（`ack_reactions`）。
+//!
+//! 鉴权相关注意：Webhook 模式支持签名校验（SHA-256 摘要）与 AES-256-CBC
+//! 加密体解密；所有失败路径都 fail-closed（签名缺失/长度错误直接拒绝）。
+//! 内部缓存只有 token（带主动刷新 TTL）与去重集合，不缓存 peer 名单
+//! （见 AGENTS.md「单一事实来源」）。
+
 use aes::Aes256;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -19,13 +47,18 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::pairing::constant_time_eq;
 use zeroclaw_config::schema::StreamMode;
 
+// 平台 HTTP API 与 WebSocket 长连接的基础域名。
+// 飞书（国内）用 open.feishu.cn，Lark（国际版）用 open.larksuite.com。
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
+// 语音下载的硬上限：超过 25 MiB 直接失败，防止内存被大音频撑爆。
 const MAX_LARK_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 
+/// 把通用的 Unicode emoji 映射成飞书 API 要求的 `emoji_type` 字符串。
+/// 用于 message reaction（表情回应）。找不到映射就返回 None（上层跳过）。
 fn unicode_to_lark_emoji_type(emoji: &str) -> Option<&'static str> {
     match emoji {
         "👍" => Some("THUMBSUP"),
@@ -40,6 +73,8 @@ fn unicode_to_lark_emoji_type(emoji: &str) -> Option<&'static str> {
     }
 }
 
+/// 平台变体：`Lark`（国际版）/ `Feishu`（国内版）。
+/// 由配置里的 `use_feishu` 决定，决定走哪套 API / WS 基础域名、请求头 locale 等。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LarkPlatform {
     Lark,
@@ -83,10 +118,13 @@ impl LarkPlatform {
     }
 }
 
+/// 飞书 WebSocket 长连接：pbbp2.proto 帧编解码。
+/// 通过 prost 定义二进制帧结构，`PbFrame` 用 `method` 区分控制帧(0)/数据帧(1)。
 // ─────────────────────────────────────────────────────────────────────────────
 // Feishu WebSocket long-connection: pbbp2.proto frame codec
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// PbFrame 的头部键值对（如 `type=ping`、`type=event`、`message_id`、`sum`/`seq`）。
 #[derive(Clone, PartialEq, prost::Message)]
 struct PbHeader {
     #[prost(string, tag = "1")]
@@ -114,6 +152,7 @@ struct PbFrame {
 }
 
 impl PbFrame {
+    /// 按 key 取头部值；找不到返回空串（用于取 `type`、`message_id`、`sum`、`seq` 等）。
     fn header_value<'a>(&'a self, key: &str) -> &'a str {
         self.headers
             .iter()
@@ -123,6 +162,7 @@ impl PbFrame {
     }
 }
 
+/// 服务器下发的客户端配置（从 pong 帧 payload 解析），如心跳间隔。
 /// Server-sent client config (parsed from pong payload)
 #[derive(Debug, serde::Deserialize, Default, Clone)]
 struct WsClientConfig {
@@ -130,6 +170,7 @@ struct WsClientConfig {
     ping_interval: Option<u64>,
 }
 
+/// `POST /callback/ws/endpoint` 的响应（获取长连接 wss 地址）。
 /// POST /callback/ws/endpoint response
 #[derive(Debug, serde::Deserialize)]
 struct WsEndpointResp {
@@ -148,6 +189,7 @@ struct WsEndpoint {
     client_config: Option<WsClientConfig>,
 }
 
+/// WS 数据帧里的通用事件信封：`header.event_type` 标明事件类型，`event` 存具体载荷。
 /// LarkEvent envelope (method=1 / type=event payload)
 #[derive(Debug, serde::Deserialize)]
 struct LarkEvent {
@@ -160,12 +202,14 @@ struct LarkEventHeader {
     event_type: String,
 }
 
+/// `im.message.receive_v1` 事件载荷：发送者 + 消息体。
 #[derive(Debug, serde::Deserialize)]
 struct MsgReceivePayload {
     sender: LarkSender,
     message: LarkMessage,
 }
 
+/// 消息发送者：`sender_type` 可能为 app / bot（机器人自己发的，需过滤）或用户类型。
 #[derive(Debug, serde::Deserialize)]
 struct LarkSender {
     sender_id: LarkSenderId,
@@ -178,6 +222,7 @@ struct LarkSenderId {
     open_id: Option<String>,
 }
 
+/// 消息体核心字段：`content` 是对应 `message_type` 的 JSON 字符串（text/post/image/file/audio/list）。
 #[derive(Debug, serde::Deserialize)]
 struct LarkMessage {
     message_id: String,
@@ -225,12 +270,15 @@ const LARK_SUPPORTED_IMAGE_MIMES: &[&str] = &[
     "image/bmp",
 ];
 
-/// Returns true when the WebSocket frame indicates live traffic that should
-/// refresh the heartbeat watchdog.
+/// 判断一个 WS 帧是否算"活流量"——二进制数据帧、ping、pong 都会刷新心跳看门狗；
+/// 文本帧/关闭帧/裸 pong 之外的帧不算。
 fn should_refresh_last_recv(msg: &WsMsg) -> bool {
     matches!(msg, WsMsg::Binary(_) | WsMsg::Ping(_) | WsMsg::Pong(_))
 }
 
+/// 构造一个"正文只有一个 markdown 元素"的交互卡片 JSON 字符串。
+/// 用 Card JSON 2.0 结构，保证标题/表格/引用/行内代码都能正确渲染。
+/// 是所有文本型出站消息（含草稿、发消息）的基础载体。
 /// Build an interactive card JSON string with a single markdown element.
 /// Uses Card JSON 2.0 structure so that headings, tables, blockquotes,
 /// and inline code render correctly.
@@ -247,6 +295,10 @@ fn build_card_content(markdown: &str) -> String {
     .to_string()
 }
 
+/// 构造审批卡片：橙色头部 + 工具名/参数摘要 + ✅ Approve / ❌ Deny / ✅✅ Always
+/// 三个按钮。按钮的 callback `value` 里携带 `approval_id`（UUID）与 `decision`，
+/// 用户点击后飞书会把整个 value 原样回传，`handle_card_action_event` 据此定位。
+/// 同一轮发出多张审批卡时还会拼接位置行（第几/共几），避免卡片长得一模一样。
 fn build_approval_card(
     approval_id: &str,
     tool_name: &str,
@@ -311,6 +363,8 @@ fn build_approval_card(
     })
 }
 
+/// 把审批卡片渲染成"已决"状态的最终卡片：根据决策取对应的头部颜色/内容
+/// （Approved 绿 / Denied 红），替换掉原来的按钮，宣布最终结果。
 fn build_resolved_approval_card(
     tool_name: &str,
     arguments_summary: &str,
@@ -348,6 +402,9 @@ fn build_resolved_approval_card(
     })
 }
 
+/// 在打印/记录卡片回调事件前，把敏感字段打码：顶层 token、operator 的
+/// open_id/union_id/user_id/tenant_key、context 的 open_chat_id/open_message_id。
+/// 只改真实存在的字段，避免虚构出正式事件本没有的结构。
 fn sanitize_card_action_payload(event_payload: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
 
@@ -400,6 +457,8 @@ fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::V
     })
 }
 
+/// 超长 markdown 截断到 `max_bytes` 且在 UTF-8 字符边界处截断，末尾追加
+/// `…_(updating)_` 提示（用于流式草稿：内容过长时只显示开头）。
 fn truncate_card_markdown(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
@@ -467,24 +526,30 @@ fn split_markdown_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
     chunks
 }
 
+/// 缓存的租户访问令牌：`value` 是 token，`refresh_after` 是提前刷新的时间点。
+/// 提前刷新而不是等过期再刷，避免并发请求打到已过期 token 上。
 #[derive(Debug, Clone)]
 struct CachedTenantToken {
     value: String,
     refresh_after: Instant,
 }
 
+/// 从飞书 API 响应体里取业务码 `code`（0 表示成功）。
 fn extract_lark_response_code(body: &serde_json::Value) -> Option<i64> {
     body.get("code").and_then(|c| c.as_i64())
 }
 
+/// 判断是否为"token 过期/无效"业务码（99_991_663）。
 fn is_lark_invalid_access_token(body: &serde_json::Value) -> bool {
     extract_lark_response_code(body) == Some(LARK_INVALID_ACCESS_TOKEN_CODE)
 }
 
+/// HTTP 401 或业务码 99991663 都判定为租户 token 失效，需要刷新后重试。
 fn should_refresh_lark_tenant_token(status: reqwest::StatusCode, body: &serde_json::Value) -> bool {
     status == reqwest::StatusCode::UNAUTHORIZED || is_lark_invalid_access_token(body)
 }
 
+/// 从响应里解析 token 有效期（`expire` 或 `expires_in`，秒）；都没有就用默认 TTL。
 fn extract_lark_token_ttl_seconds(body: &serde_json::Value) -> u64 {
     let ttl = body
         .get("expire")
@@ -500,6 +565,7 @@ fn extract_lark_token_ttl_seconds(body: &serde_json::Value) -> u64 {
     ttl.max(1)
 }
 
+/// 计算下次刷新的截止时刻：TTL 减去提前量（默认提前 120 s），最短 1 s。
 fn next_token_refresh_deadline(now: Instant, ttl_seconds: u64) -> Instant {
     let ttl = Duration::from_secs(ttl_seconds.max(1));
     let refresh_in = ttl
@@ -507,6 +573,9 @@ fn next_token_refresh_deadline(now: Instant, ttl_seconds: u64) -> Instant {
         .unwrap_or(Duration::from_secs(1));
     now + refresh_in
 }
+
+/// 统一检查"发送类"请求是否成功：HTTP 非 2xx 或业务码非 0 都报错。
+/// `context` 仅用于报错文案（如 "text send"/"upload image"）。
 
 fn ensure_lark_send_success(
     status: reqwest::StatusCode,
@@ -525,6 +594,7 @@ fn ensure_lark_send_success(
     Ok(())
 }
 
+/// 出站媒体的种类：图片，或文件（带飞书 API 要求的 `file_type` 字段）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LarkOutgoingMediaKind {
     Image,
@@ -532,6 +602,8 @@ enum LarkOutgoingMediaKind {
 }
 
 impl LarkOutgoingMediaKind {
+    /// 把 `[IMAGE:...]` / `[FILE:...]` 等 marker 里的 kind 字符串映射成具体类型。
+    /// VIDEO/AUDIO/VOICE 也归为文件，只是 `file_type` 不同。
     fn from_marker_kind(kind: &str) -> Option<Self> {
         match kind.trim().to_ascii_uppercase().as_str() {
             "IMAGE" | "PHOTO" => Some(Self::Image),
@@ -545,12 +617,14 @@ impl LarkOutgoingMediaKind {
     }
 }
 
+/// 解析后但尚未落盘校验的出站媒体 marker（`target` 是相对 workspace 的路径或 URL）。
 #[derive(Debug, Clone)]
 struct LarkOutgoingMediaMarker {
     kind: LarkOutgoingMediaKind,
     target: String,
 }
 
+/// 已经过路径校验、确认指向一个真实存在的文件后的出站媒体。
 #[derive(Debug, Clone)]
 struct LarkResolvedMediaMarker {
     kind: LarkOutgoingMediaKind,
@@ -558,12 +632,14 @@ struct LarkResolvedMediaMarker {
     file_name: String,
 }
 
+/// 已上传成功、拿到 file_key/image_key 后可直接用于发消息的媒体内容。
 #[derive(Debug, Clone)]
 struct LarkPreparedMediaMessage {
     msg_type: &'static str,
     content: serde_json::Value,
 }
 
+/// 把 marker 的 kind/target 转成 `LarkOutgoingMediaMarker`；kind 无法识别则返回 None。
 fn lark_outgoing_media_from_marker(
     kind: String,
     target: String,
@@ -574,6 +650,8 @@ fn lark_outgoing_media_from_marker(
     })
 }
 
+/// 校验媒体 target 是否安全：拒绝 http/https/data/file 等 URL 协议（只允许本地路径），
+/// 且最终路径解析后必须落在 workspace_dir 内（防目录穿越读任意文件）。
 fn validate_lark_marker_target(
     target: &str,
     workspace_dir: Option<&Path>,
@@ -650,6 +728,7 @@ fn validate_lark_marker_target(
     Ok(candidate)
 }
 
+/// 在路径安全校验通过的基础上，进一步确认对象是"非空、是文件"，并取出文件名。
 fn resolve_lark_media_marker(
     marker: &LarkOutgoingMediaMarker,
     workspace_dir: Option<&Path>,
@@ -679,6 +758,7 @@ fn resolve_lark_media_marker(
     })
 }
 
+/// 读取图片文件内容，构造 `/im/v1/images` 上传接口所需的 multipart 表单。
 async fn build_lark_image_upload_form(marker: &LarkResolvedMediaMarker) -> anyhow::Result<Form> {
     let bytes = fs::read(&marker.path).await.map_err(|err| {
         anyhow::Error::msg(format!(
@@ -691,6 +771,7 @@ async fn build_lark_image_upload_form(marker: &LarkResolvedMediaMarker) -> anyho
     ))
 }
 
+/// 读取文件内容，构造 `/im/v1/files` 上传接口所需的 multipart 表单（带 file_type）。
 async fn build_lark_file_upload_form(
     marker: &LarkResolvedMediaMarker,
     file_type: &'static str,
@@ -721,6 +802,8 @@ struct PendingApproval {
     arguments_summary: String,
 }
 
+/// 飞书渠道主结构。持有应用凭据、接收模式、peer 解析器等全部运行态配置。
+/// clone 是廉价的（全部字段要么 `Arc` 要么基本类型），可安全跨任务共享。
 #[derive(Clone)]
 pub struct LarkChannel {
     app_id: String,
@@ -775,6 +858,7 @@ pub struct LarkChannel {
     api_base_override: Option<String>,
 }
 
+/// Webhook（HTTP 回调）模式下的 axum 应用共享状态：校验 token、渠道句柄、入站消息管道。
 #[derive(Clone)]
 struct LarkHttpAppState {
     verification_token: String,
@@ -782,6 +866,7 @@ struct LarkHttpAppState {
     tx: tokio::sync::mpsc::Sender<ChannelMessage>,
 }
 
+/// Webhook 是否配置了至少一种鉴权：配置了 verification_token 或 encrypt_key 即算。
 fn lark_webhook_auth_configured(verification_token: &str, encrypt_key: Option<&str>) -> bool {
     !verification_token.is_empty() || encrypt_key.is_some_and(|key| !key.is_empty())
 }
@@ -822,6 +907,10 @@ fn lark_webhook_is_encrypted(payload: &serde_json::Value) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
+/// Webhook 请求总体鉴权入口。有两种认证路径：
+/// 1. 加密/带签名头 → 用 `encrypt_key` 对 `timestamp+nonce+key+body` 做 SHA-256 校验；
+/// 2. 明文事件 → 校验事件里的 verification token。
+/// 签名头不完整、签名长度/格式不对都会 fail-closed 直接拒绝。
 fn verify_lark_webhook_request(
     verification_token: &str,
     encrypt_key: Option<&str>,
@@ -881,6 +970,8 @@ fn verify_lark_webhook_request(
     )
 }
 
+/// 解密飞书 Webhook 的加密消息体：encrypt_key 经 SHA-256 得 AES-256 密钥，
+/// 明文主体为 CBC 模式 + PKCS7 填充。如果没有 encrypt 字段则原样返回。
 fn decrypt_lark_webhook_body(body: &[u8], encrypt_key: Option<&str>) -> anyhow::Result<Vec<u8>> {
     let envelope: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| anyhow::Error::msg(format!("invalid webhook JSON payload: {error}")))?;
@@ -915,6 +1006,12 @@ fn decrypt_lark_webhook_body(body: &[u8], encrypt_key: Option<&str>) -> anyhow::
     Ok(plaintext.to_vec())
 }
 
+/// HTTP Webhook 的总入口处理器（axum 路由 `/lark`）：
+/// 1. 解析 + 鉴权（加密体先验签再解密；明文事件验 verification token）；
+/// 2. 处理 URL 验证 challenge（回显 challenge 原值）；
+/// 3. 卡片按钮点击事件（`card.action.trigger`）走审批收口，不走普通消息解析；
+/// 4. 其余事件交给 `parse_event_payload_async` 转成 `ChannelMessage`，
+///    按 `ack_reactions` 配置异步打 👀 表情，再逐个送入入站管道 `tx`。
 async fn handle_lark_http_event(
     axum::extract::State(state): axum::extract::State<LarkHttpAppState>,
     headers: axum::http::HeaderMap,
@@ -1081,13 +1178,18 @@ async fn handle_lark_http_event(
     (StatusCode::OK, "ok").into_response()
 }
 
+/// 组装 Webhook 模式的 axum 路由：仅路由 `POST /lark` 到上面的处理器。
 fn build_lark_http_router(state: LarkHttpAppState) -> axum::Router {
     axum::Router::new()
         .route("/lark", axum::routing::post(handle_lark_http_event))
         .with_state(state)
 }
 
+// =============================================================================
+// LarkChannel 内部实现（构造函数 / 配置 / 工具方法 / WS 长连接 / 收发）
+// =============================================================================
 impl LarkChannel {
+    /// 创建渠道句柄（默认平台为 Lark 国际版；国内飞书请用 `from_config`）。
     pub fn new(
         app_id: String,
         app_secret: String,
@@ -1115,6 +1217,8 @@ impl LarkChannel {
         &self.alias
     }
 
+    /// 带平台变体的构造器：填好全部字段的默认值。后续用 `from_config` /
+    /// `with_*` 链式调用覆盖具体配置。
     fn new_with_platform(
         app_id: String,
         app_secret: String,
@@ -1151,6 +1255,10 @@ impl LarkChannel {
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            // =============================================================================
+            // 单元测试：以下全部为 #[cfg(test)]，覆盖 URL 构造、鉴权、卡片、消息解析、
+            // token 刷新、审批回调与媒体上传发送等路径，不参与生产编译。
+            // =============================================================================
             #[cfg(test)]
             api_base_override: None,
         }
@@ -1233,6 +1341,8 @@ impl LarkChannel {
         self
     }
 
+    /// 决定消息的 sender 归属：开启 per_user_session 时用发送者 open_id（群聊按人隔离会话），
+    /// 否则用 chat_id（单聊里每个用户-机器人组合的 chat_id 本来就唯一）。
     fn resolve_sender<'a>(&self, chat_id: &'a str, sender_open_id: Option<&'a str>) -> &'a str {
         if self.per_user_session {
             match sender_open_id {
@@ -1272,6 +1382,7 @@ impl LarkChannel {
         self
     }
 
+    /// 构建带代理的 reqwest Client（按渠道 proxy 服务键解析代理配置）。
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_channel_proxy_client(
             self.platform.proxy_service_key(),
@@ -1295,6 +1406,7 @@ impl LarkChannel {
         self.platform.ws_base()
     }
 
+    /// 以下一组方法只是把各个飞书/Lark API 的 URL 拼出来，测试里可以覆盖 base URL。
     fn tenant_access_token_url(&self) -> String {
         format!("{}/auth/v3/tenant_access_token/internal", self.api_base())
     }
@@ -1381,6 +1493,8 @@ impl LarkChannel {
         Ok(response)
     }
 
+    /// 向飞书申请长连接地址：`POST /callback/ws/endpoint`，用 app_id/app_secret 换 wss URL，
+    /// 并带上平台 locale 头（影响服务器返回的 ping 间隔等配置）。
     /// POST /callback/ws/endpoint → (wss_url, client_config)
     async fn get_ws_endpoint(&self) -> anyhow::Result<(String, WsClientConfig)> {
         let resp = self
@@ -1414,8 +1528,14 @@ impl LarkChannel {
         Ok((ep.url, ep.client_config.unwrap_or_default()))
     }
 
-    /// WS long-connection event loop.  Returns Ok(()) when the connection closes
-    /// (the caller reconnects).
+    /// WS long-connection 事件循环核心。 连接被服务端关闭时返回 `Ok(())`，由调用方重连。
+    /// 主循环用 `tokio::select!` 同时处理三件事：
+    /// - 定时 ping：按服务器下发的 `ping_interval` 心跳，顺带 GC 超过 5 分钟的碎片缓存；
+    /// - 超时检查：超过 `WS_HEARTBEAT_TIMEOUT`（300 s）没收到任何活流量就断开重连；
+    /// - 读帧：校验 proto、回 ACK（飞书要求 3 秒内应答）、按 `sum/seq` 重组多分片事件，
+    ///   处理 pong（动态校准心跳间隔），把 `im.message.receive_v1` 事件解码成消息、
+    ///   去重、按类型取文本/下载图片/文件/转录语音，群聊校验 @，最后发 ACK 表情并入管道。
+    /// Returns Ok(()) when the connection closes (the caller reconnects).
     #[allow(clippy::too_many_lines)]
     async fn listen_ws(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
@@ -1776,13 +1896,16 @@ impl LarkChannel {
     }
 
     /// Check if a user open_id is allowed
+    /// 判断某个 open_id 是否在 peer 白名单内（大小写敏感精确匹配/通配）。
     fn is_user_allowed(&self, open_id: &str) -> bool {
         let peers = (self.peer_resolver)();
         crate::allowlist::is_user_allowed(&peers, open_id, crate::allowlist::Match::Sensitive)
     }
 
+    /// 获取（必要时请求并缓存）租户访问令牌。
     /// Get or refresh tenant access token
     async fn get_tenant_access_token(&self) -> anyhow::Result<String> {
+        // 先查缓存：未到刷新时刻就直接复用，减少无谓请求。
         // Check cache first
         {
             let cached = self.tenant_token.read().await;
@@ -2125,6 +2248,7 @@ impl LarkChannel {
         ))
     }
 
+    /// 用给定 token 请求 `/bot/v3/info`，返回 (HTTP 状态, 响应体)。
     async fn fetch_bot_open_id_with_token(
         &self,
         token: &str,
@@ -2143,6 +2267,8 @@ impl LarkChannel {
         Ok((status, body))
     }
 
+    /// 刷新并缓存机器人自身的 open_id（token 失效时自动重试一次）。
+    /// 群聊"仅 @回复"模式依赖它来确认别人 @ 的是本机器人。
     async fn refresh_bot_open_id(&self) -> anyhow::Result<Option<String>> {
         let token = self.get_tenant_access_token().await?;
         let (status, body) = self.fetch_bot_open_id_with_token(&token).await?;
@@ -2181,6 +2307,8 @@ impl LarkChannel {
         Ok(bot_open_id)
     }
 
+    /// 确保机器人的 open_id 已被解析：仅当开启 mention_only 且尚未解析时才真正拉取。
+    /// 拉不到只会打日志（群聊@回复会被忽略），不会让整体启动失败。
     async fn ensure_bot_open_id(&self) {
         if !self.mention_only || self.resolved_bot_open_id().is_some() {
             return;
@@ -2215,6 +2343,7 @@ impl LarkChannel {
         }
     }
 
+    /// 边下载边累积音频字节，超过 25 MiB 上限立即报错，防止内存耗尽。
     async fn stream_audio_bytes(mut resp: reqwest::Response) -> anyhow::Result<Vec<u8>> {
         let mut body = Vec::new();
         while let Some(chunk) = resp.chunk().await? {
@@ -2226,6 +2355,7 @@ impl LarkChannel {
         Ok(body)
     }
 
+    /// 下载语音资源（type=file），token 失效时刷新后重试一次，返回 (字节, 推断文件名)。
     async fn download_audio_resource(
         &self,
         message_id: &str,
@@ -2274,6 +2404,8 @@ impl LarkChannel {
         Ok((bytes, inferred_audio_filename(file_key)))
     }
 
+    /// 把一条语音消息完整走一遍"下载 + 交给 TranscriptionManager 转写"的流程，
+    /// 返回转写文本；任一环节失败返回 None（上层跳过该消息）。
     async fn try_transcribe_audio_message(
         &self,
         message_id: &str,
@@ -2445,6 +2577,7 @@ impl LarkChannel {
         }]
     }
 
+    /// 发一次 JSON POST 请求，返回 (HTTP 状态, 解析后的响应体)。
     async fn send_text_once(
         &self,
         url: &str,
@@ -2466,6 +2599,8 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
+    /// 发 JSON POST，token 失效时刷新后整体重试一次；两次都失败则报错。
+    /// 这是所有"发文本/发卡/发媒体"共用的发送骨架。
     async fn send_json_with_token_refresh(
         &self,
         url: &str,
@@ -2494,6 +2629,7 @@ impl LarkChannel {
         Ok(())
     }
 
+    /// 发一次 multipart POST（用于图片/文件上传），返回 (HTTP 状态, 响应体)。
     async fn post_multipart_once(
         &self,
         url: &str,
@@ -2514,6 +2650,7 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
+    /// 上传图片到 `/im/v1/images`，返回 image_key（token 失效自动重试一次）。
     async fn upload_lark_image(
         &self,
         token: &mut String,
@@ -2548,6 +2685,7 @@ impl LarkChannel {
             .ok_or_else(|| anyhow::Error::msg("Lark/Feishu image upload returned no image_key"))
     }
 
+    /// 上传文件到 `/im/v1/files`，返回 file_key（token 失效自动重试一次）。
     async fn upload_lark_file(
         &self,
         token: &mut String,
@@ -2583,6 +2721,7 @@ impl LarkChannel {
             .ok_or_else(|| anyhow::Error::msg("Lark/Feishu file upload returned no file_key"))
     }
 
+    /// 把一个已落盘校验的媒体 marker 上传成可发送的状态（拿到 key 并组装好 message body）。
     async fn prepare_lark_media_marker(
         &self,
         token: &mut String,
@@ -2602,6 +2741,7 @@ impl LarkChannel {
         Ok(LarkPreparedMediaMessage { msg_type, content })
     }
 
+    /// 发送一条媒体（图片/文件）消息：以 `receive_id` 为目标、`msg_type`+content 为载荷。
     async fn send_lark_media_message(
         &self,
         token: &mut String,
@@ -2618,6 +2758,10 @@ impl LarkChannel {
             .await
     }
 
+    /// 把飞书事件回调的 payload 解析成零到多条 `ChannelMessage`。
+    /// 只认 `im.message.receive_v1`；按消息类型分别取文本（text / post 富文本 /
+    /// image 下载成 marker / file 下载成文本或附件说明 / list），
+    /// 过滤机器人自身消息与白名单外用户，群聊校验 @，最后组装成标准消息。
     /// Parse an event callback payload and extract messages.
     /// Supports text, post, image, and file message types.
     pub async fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
@@ -2868,6 +3012,9 @@ impl LarkChannel {
     }
 }
 
+// =============================================================================
+// Attributable + Channel trait 实现（与运行时主循环对接的契约）
+// =============================================================================
 impl ::zeroclaw_api::attribution::Attributable for LarkChannel {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
         ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Lark)
@@ -2879,10 +3026,13 @@ impl ::zeroclaw_api::attribution::Attributable for LarkChannel {
 
 #[async_trait]
 impl Channel for LarkChannel {
+    /// 渠道名（恒为 "lark"，用于路由身份标识）。
     fn name(&self) -> &str {
         self.channel_name()
     }
 
+    /// 出站发送：先解析内容里的 `[IMAGE:...]`/`[FILE:...]` marker 并校验/上传；
+    /// 文本部分按卡片上限分块发交互卡；最后依次发准备好的媒体消息。
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut token = self.get_tenant_access_token().await?;
         let url = self.send_message_url(&message.recipient);
@@ -2917,6 +3067,8 @@ impl Channel for LarkChannel {
         Ok(())
     }
 
+    /// 根据 receive_mode 选择监听方式：Websocket → 长连接，Webhook → HTTP 回调服务。
+    /// 两者都会把解析出的 ChannelMessage 送入 `tx` 管道，连接断开/服务器停止时返回。
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         use zeroclaw_config::schema::LarkReceiveMode;
         match self.receive_mode {
@@ -2925,6 +3077,7 @@ impl Channel for LarkChannel {
         }
     }
 
+    /// 健康检查：能否成功拿到租户 token（即凭据与网络是否可用）。
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
     }
@@ -2938,6 +3091,8 @@ impl Channel for LarkChannel {
         Ok(())
     }
 
+    /// 加表情回应：受 `ack_reactions` 开关控制；unicode emoji 映射成飞书 emoji_type，
+    /// 用 `reaction_ids` 缓存去重避免重复 POST，成功后记录 reaction_id 供删除用。
     async fn add_reaction(
         &self,
         _channel_id: &str,
@@ -3046,6 +3201,8 @@ impl Channel for LarkChannel {
         }
     }
 
+    /// 删除表情回应：需要先知道 reaction_id（由 add 时缓存），缓存未命中直接跳过。
+    /// 服务端返回的"已过期/不存在"类业务码按软错误处理，不报错。
     async fn remove_reaction(
         &self,
         _channel_id: &str,
@@ -3160,6 +3317,8 @@ impl Channel for LarkChannel {
         }
     }
 
+    /// 发起审批：构造 approval_id + 审批卡 → 先登记到 pending_approvals → 发卡 →
+    /// 等用户点击（`wait_for_decision`）。发送失败会回滚登记；超时由等待侧合成 Deny。
     /// Delegates to [`Self::request_approval_attributed`] and drops the
     /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
@@ -3173,6 +3332,8 @@ impl Channel for LarkChannel {
             .map(|attributed| attributed.response))
     }
 
+    /// 审批卡的完整流程实现（带来源标注）。关键点：**发卡前先登记 pending**，
+    /// 这样用户在卡片发出瞬间就点按钮也能命中；卡片发出后回填 message_id 供 PATCH。
     async fn request_approval_attributed(
         &self,
         recipient: &str,
@@ -3258,10 +3419,13 @@ impl Channel for LarkChannel {
         Ok(Some(self.wait_for_decision(rx, &approval_id).await))
     }
 
+    /// 仅 Partial 流式模式支持草稿（MultiMessage 已在上游被降级为 Off）。
     fn supports_draft_updates(&self) -> bool {
         matches!(self.stream_mode, StreamMode::Partial)
     }
 
+    /// 首条草稿：发一张携带当前内容的占位卡，返回它的 message_id 供后续 update。
+    /// 任何失败都回退到普通 `send`（返回 None 让上层走常规路径）。
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         if !matches!(self.stream_mode, StreamMode::Partial) {
             return Ok(None);
@@ -3314,6 +3478,9 @@ impl Channel for LarkChannel {
         Ok(message_id)
     }
 
+    /// 增量更新草稿卡：只接受 `message_id` 非空的有效调用，并且受
+    /// `draft_update_interval_ms` 限速（同一卡片两次 PATCH 的最小间隔），
+    /// 之后再调用 `patch_card_content` 真正改写卡片内容。
     async fn update_draft(
         &self,
         _recipient: &str,
@@ -3351,6 +3518,8 @@ impl Channel for LarkChannel {
         self.update_draft(recipient, message_id, text).await
     }
 
+    /// 把最终回复提交进草稿卡：第一段 PATCH 进已有卡片，溢出段/媒体走普通发送，
+    /// 保证超长回复也能完整落地。`message_id` 为空则完全退回 `send`。
     /// Commit the final response into the draft card. The first chunk is
     /// PATCH-applied to the existing message_id; any overflow chunks are
     /// posted as fresh interactive cards (with a single token-refresh retry
@@ -3404,6 +3573,7 @@ impl Channel for LarkChannel {
         Ok(())
     }
 
+    /// 取消草稿：把卡片改成 "(cancelled)" 并清理限速记录。
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
         let result = self
             .update_draft(recipient, message_id, "_(cancelled)_")
@@ -3413,7 +3583,13 @@ impl Channel for LarkChannel {
     }
 }
 
+// =============================================================================
+// 草稿卡片 PATCH 工具（流式更新/审批卡定型共用）
+// =============================================================================
 impl LarkChannel {
+    /// 用 PATCH 改写一张已发送的卡片内容。设计成"软失败"：
+    /// 传输错误、token 刷新失败、限流（code=230020）都只记日志不抛错——
+    /// 因为草稿是每 token 一更，单次抖动不能打断整个生成循环。
     async fn patch_card_content(&self, message_id: &str, markdown: &str) -> anyhow::Result<()> {
         let url = self.patch_message_url(message_id);
         let body = serde_json::json!({
@@ -3515,7 +3691,15 @@ impl LarkChannel {
     }
 }
 
+// =============================================================================
+// 审批决策等待与卡片回调处理
+// =============================================================================
 impl LarkChannel {
+    /// 等待用户点击审批按钮：
+    /// - 成功点击 → 返回带 `ApprovalSource::Operator` 来源的结果；
+    /// - 发送端通道断开（oneshot Err）或超时 → 移除 pending 条目，合成一个带
+    ///   `Unreachable`/`TimedOut` 来源的 Deny，绝不 panic。
+    /// 带来源是为了区分"用户真拒绝"和"没人拒绝"，避免把机器人自判的拒绝误报成用户拒绝。
     /// Wait for the user's approval click; on timeout, evict the pending entry
     /// and synthesize a `Deny` response. Never panics.
     ///
@@ -3548,6 +3732,9 @@ impl LarkChannel {
         }
     }
 
+    /// 用户点击后把审批卡 PATCH 成已决状态（替换按钮为结果横条）。
+    /// 所有错误路径（传输/token 刷新/限流/非 0 code）都是软失败——用户可见的决策
+    /// 已经通过 oneshot 送达，卡片美化失败不应向上抛错。
     /// PATCH an approval card to its resolved state. Soft-fails on every error
     /// path (transport / token refresh / rate-limited / non-zero code) — never
     /// propagates to the caller, since the user-visible decision is already
@@ -3672,6 +3859,8 @@ impl LarkChannel {
         }
     }
 
+    /// 单次 HTTP 请求：按 `is_patch` 选 PATCH 或 POST，用当前 token 发 JSON，
+    /// 返回 (HTTP 状态, 解析后的响应体)。是否在 token 失效后重试由调用方决定。
     /// Single-shot HTTP request used by `patch_approval_card_resolved`. Builds
     /// PATCH (when `is_patch=true`) or POST request with current tenant token,
     /// returns parsed JSON body and the HTTP status. Caller decides whether to
@@ -3701,6 +3890,9 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
+    /// 在所有入站路径（WS 数据帧 / HTTP webhook）处理真正的事件之前，先拦住
+    /// `card.action.trigger`（卡片按钮点击），把它们路由到审批收口逻辑，避免误入普通消息解析。
+    /// 一旦识别为卡片动作就返回 `true`（事件被消费），即使回调内部出错也不放行给普通路径。
     /// Route card-action envelopes before either ingress treats them as ordinary messages.
     /// Returns `true` once the envelope is consumed, even when the callback is rejected.
     async fn handle_card_action_ingress(
@@ -3732,6 +3924,11 @@ impl LarkChannel {
         true
     }
 
+    /// 处理一次卡片按钮点击回调：
+    /// 1. 解析 action.value 里的 `approval_id` 和 `decision`（approve/deny/always）；
+    /// 2. 校验 operator 与来源群聊（白名单 + destination 匹配），失败则拒绝但不误解析审批；
+    /// 3. 取走 pending 条目 → 通过 oneshot 唤醒等待方 → PATCH 成已决卡片。
+    /// 未知的 decision 明确"不解析审批"，让等待方走超时路径拿到运行时来源，防止误报"用户拒绝"。
     async fn handle_card_action_event(
         &self,
         event_payload: &serde_json::Value,
@@ -3868,6 +4065,9 @@ impl LarkChannel {
         Ok(())
     }
 
+    /// 从 pending 表里取出并移除一个审批记录，前提是：按下的用户在白名单内、
+    /// 且回调里的来源群聊与目标 recipient 完全一致（防止跨会话乱点导致误批）。
+    /// 校验不通过返回 None，调用方把该点击当作无效回调处理。
     async fn take_pending_approval(
         &self,
         approval_id: &str,
@@ -3889,7 +4089,13 @@ impl LarkChannel {
     }
 }
 
+// =============================================================================
+// Webhook（HTTP 回调）服务入口
+// =============================================================================
 impl LarkChannel {
+    /// 启动一个绑定 0.0.0.0:port 的 HTTP 回调服务器。属于传统模式（需要公网地址），
+    /// 新部署推荐 `listen()` 走 WS 长连接。启动前强制要求配置了 verification_token
+    /// 或 encrypt_key（否则直接拒绝），并确保 bot open_id 已解析。
     /// HTTP callback server (legacy — requires a public endpoint).
     /// Use `listen()` (WS long-connection) for new deployments.
     pub async fn listen_http(
@@ -3947,9 +4153,11 @@ impl LarkChannel {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WS helper functions
+// 出站/入站辅助函数（文件名推断、MIME 探测、接收者类型、富文本/列表解析、群聊@判定）
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// 为语音文件推断一个可被转录器识别的文件名：原 file_key 已带已知音频后缀则沿用，
+/// 否则兜底为 "voice.m4a"（很多 file_key 不带扩展名）。
 fn inferred_audio_filename(file_key: &str) -> String {
     const SUPPORTED_EXTENSIONS: &[&str] = &[".m4a", ".ogg", ".mp3", ".aac", ".wav"];
     let file_key_lower = file_key.to_lowercase();
@@ -3963,6 +4171,8 @@ fn inferred_audio_filename(file_key: &str) -> String {
     }
 }
 
+/// 按文件开头二进制签名探测图片 MIME（PNG/JPEG/GIF/WebP/BMP），
+/// 探测不到时退回到 Content-Type 头（去掉参数部分、只认 image/*）。
 /// Detect image MIME type from magic bytes, falling back to Content-Type header.
 fn lark_detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<String> {
     if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
@@ -4050,6 +4260,7 @@ fn lark_is_text_filename(name: &str) -> bool {
     )
 }
 
+/// 把内联的文本文件内容做预览，超过 50 KB 截断并标注 "[truncated]"。
 fn lark_inline_text_file_preview(text: Cow<'_, str>) -> String {
     if text.len() > 50_000 {
         let end = text.floor_char_boundary(50_000);
@@ -4059,11 +4270,15 @@ fn lark_inline_text_file_preview(text: Cow<'_, str>) -> String {
     }
 }
 
+/// 富文本(post)消息解析结果：拼接后的纯文本 + 其中 @ 到的 open_id 列表。
 struct ParsedPostContent {
     text: String,
     mentioned_open_ids: Vec<String>,
 }
 
+/// 解析飞书"富文本(post)"消息：先按 locale 取正文（zh_cn/en_us），再把
+/// 标题和各段落在内的元素展平成纯文本；text/a/at 标签分别取其显示文本，
+/// `at` 标签同时收集被 @ 用户的 open_id（供群聊 @ 判定用）。
 fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
     let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let locale = parsed
@@ -4149,6 +4364,8 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
     }
 }
 
+/// 解析飞书"列表(list)"消息：兼容 `items` 直挂顶层或放在 `content` 下的两种结构，
+/// 递归转换成带缩进的 markdown 列表文本。
 fn parse_list_content(content: &str) -> Option<String> {
     let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
 
@@ -4215,6 +4432,7 @@ fn collect_list_items(items: &[serde_json::Value], lines: &mut Vec<String>, dept
 }
 
 /// Extract text from a single Feishu inline element (text, link, at-mention).
+/// 从单个飞书行内元素（text / 链接 a / @at）里提取显示文本。
 fn extract_inline_text(el: &serde_json::Value, out: &mut String) {
     match el.get("tag").and_then(|t| t.as_str()).unwrap_or("") {
         "text" => {
@@ -4244,6 +4462,7 @@ fn extract_inline_text(el: &serde_json::Value, out: &mut String) {
     }
 }
 
+/// 判断 mention 元素里的 open_id 是否等于本机器人的 open_id（兼容两种字段嵌套结构）。
 fn mention_matches_bot_open_id(mention: &serde_json::Value, bot_open_id: &str) -> bool {
     mention
         .pointer("/id/open_id")
@@ -4252,6 +4471,8 @@ fn mention_matches_bot_open_id(mention: &serde_json::Value, bot_open_id: &str) -
         .is_some_and(|value| value == bot_open_id)
 }
 
+/// 群聊里是否该响应：`mention_only=true` 时，必须能从顶层 mentions 或 post 解析出的
+/// @列表里找到本机器人；拿不到机器人 open_id 或没有任何 @ 时一律不响应。
 /// In group chats, only respond when the bot is explicitly @-mentioned.
 fn should_respond_in_group(
     mention_only: bool,
