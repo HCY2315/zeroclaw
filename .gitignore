@@ -126,3 +126,6 @@ target/openapi.json
 /v[0-9]*.toml
 .worktrees/
 .zero-to-5/
+
+# Local Feishu/Lark demo credentials (real app_secret must never be committed)
+crates/zeroclaw-channels/examples/feishu.toml

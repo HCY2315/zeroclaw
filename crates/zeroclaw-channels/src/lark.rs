@@ -120,11 +120,8 @@ impl LarkPlatform {
 
 /// 飞书 WebSocket 长连接：pbbp2.proto 帧编解码。
 /// 通过 prost 定义二进制帧结构，`PbFrame` 用 `method` 区分控制帧(0)/数据帧(1)。
-// ─────────────────────────────────────────────────────────────────────────────
-// Feishu WebSocket long-connection: pbbp2.proto frame codec
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// PbFrame 的头部键值对（如 `type=ping`、`type=event`、`message_id`、`sum`/`seq`）。
+///
+/// Feishu WebSocket long-connection: pbbp2.proto frame codec
 #[derive(Clone, PartialEq, prost::Message)]
 struct PbHeader {
     #[prost(string, tag = "1")]
@@ -233,6 +230,12 @@ struct LarkMessage {
     content: String,
     #[serde(default)]
     mentions: Vec<serde_json::Value>,
+    /// 仅话题（topic）消息出现；用它判定消息是否属于话题。
+    #[serde(default)]
+    thread_id: Option<String>,
+    /// 话题根消息的 message_id；回复话题时作为 `root_id` 锚点。
+    #[serde(default)]
+    root_id: Option<String>,
 }
 
 /// Heartbeat timeout for WS connection — must be larger than ping_interval (default 120 s).
@@ -449,12 +452,28 @@ fn sanitize_card_action_payload(event_payload: &serde_json::Value) -> serde_json
 }
 
 /// Build the full message body for sending an interactive card message.
-fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::Value {
-    serde_json::json!({
-        "receive_id": recipient,
+/// `root_id`（话题根消息 ID）非 None 时按话题回复构造：
+/// 请求体只含 `content`/`msg_type`/`reply_in_thread` 且不带 `receive_id`
+/// （走 `/im/v1/messages/{root_id}/reply` 端点，URL 已带目标消息）。
+/// 否则按普通发消息构造（带 `receive_id`）。
+fn build_interactive_card_body(
+    recipient: &str,
+    markdown: &str,
+    root_id: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
         "msg_type": "interactive",
         "content": build_card_content(markdown),
-    })
+    });
+    match root_id {
+        Some(_root_id) => {
+            body["reply_in_thread"] = serde_json::Value::Bool(true);
+        }
+        None => {
+            body["receive_id"] = serde_json::Value::String(recipient.to_string());
+        }
+    }
+    body
 }
 
 /// 超长 markdown 截断到 `max_bytes` 且在 UTF-8 字符边界处截断，末尾追加
@@ -576,7 +595,6 @@ fn next_token_refresh_deadline(now: Instant, ttl_seconds: u64) -> Instant {
 
 /// 统一检查"发送类"请求是否成功：HTTP 非 2xx 或业务码非 0 都报错。
 /// `context` 仅用于报错文案（如 "text send"/"upload image"）。
-
 fn ensure_lark_send_success(
     status: reqwest::StatusCode,
     body: &serde_json::Value,
@@ -909,8 +927,8 @@ fn lark_webhook_is_encrypted(payload: &serde_json::Value) -> bool {
 
 /// Webhook 请求总体鉴权入口。有两种认证路径：
 /// 1. 加密/带签名头 → 用 `encrypt_key` 对 `timestamp+nonce+key+body` 做 SHA-256 校验；
-/// 2. 明文事件 → 校验事件里的 verification token。
-/// 签名头不完整、签名长度/格式不对都会 fail-closed 直接拒绝。
+/// 2. 明文事件 → 校验事件里的 verification token；
+///    签名头不完整、签名长度/格式不对都会 fail-closed 直接拒绝。
 fn verify_lark_webhook_request(
     verification_token: &str,
     encrypt_key: Option<&str>,
@@ -1423,6 +1441,13 @@ impl LarkChannel {
         )
     }
 
+    /// 回复消息/话题的专用端点：`/im/v1/messages/:message_id/reply`。
+    /// 话题回复必须走这里——发消息接口（create）的请求体不支持 `root_id` /
+    /// `reply_in_thread`，传了也会被忽略并退化成一条新消息。
+    fn reply_message_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}/reply", self.api_base())
+    }
+
     /// PATCH endpoint for updating the content of a previously-sent message
     /// (used to flip an approval card from its interactive state to its
     /// resolved/banner state after the user clicks a button).
@@ -1535,7 +1560,7 @@ impl LarkChannel {
     /// - 读帧：校验 proto、回 ACK（飞书要求 3 秒内应答）、按 `sum/seq` 重组多分片事件，
     ///   处理 pong（动态校准心跳间隔），把 `im.message.receive_v1` 事件解码成消息、
     ///   去重、按类型取文本/下载图片/文件/转录语音，群聊校验 @，最后发 ACK 表情并入管道。
-    /// Returns Ok(()) when the connection closes (the caller reconnects).
+    ///   Returns Ok(()) when the connection closes (the caller reconnects).
     #[allow(clippy::too_many_lines)]
     async fn listen_ws(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
@@ -1867,7 +1892,14 @@ impl LarkChannel {
                     });
                     } // if self.ack_reactions
 
-                    let channel_msg = ChannelMessage {
+                    let topic_anchor =
+                        if lark_msg.thread_id.as_deref().is_some_and(|t| !t.is_empty()) {
+                            lark_msg.root_id.clone().filter(|r| !r.is_empty())
+                        } else {
+                            None
+                        };
+
+                    let mut channel_msg = ChannelMessage {
                         id: lark_msg.message_id.clone(),
                         sender: self
                             .resolve_sender(&lark_msg.chat_id, Some(sender_open_id))
@@ -1886,6 +1918,7 @@ impl LarkChannel {
                         subject: None,
 
                         ..Default::default()};
+                    Self::fill_topic_fields(&mut channel_msg, topic_anchor);
 
                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: message in {}", lark_msg.chat_id));
                     if tx.send(channel_msg).await.is_err() { break; }
@@ -2560,7 +2593,11 @@ impl LarkChannel {
                     .as_secs()
             });
 
-        vec![ChannelMessage {
+        let topic_anchor = payload
+            .pointer("/event/message")
+            .and_then(Self::lark_message_topic_anchor);
+
+        let mut channel_msg = ChannelMessage {
             id: message_id.to_string(),
             sender: self.resolve_sender(chat_id, Some(open_id)).to_string(),
             reply_target: chat_id.to_string(),
@@ -2574,7 +2611,10 @@ impl LarkChannel {
             subject: None,
 
             ..Default::default()
-        }]
+        };
+        Self::fill_topic_fields(&mut channel_msg, topic_anchor);
+
+        vec![channel_msg]
     }
 
     /// 发一次 JSON POST 请求，返回 (HTTP 状态, 解析后的响应体)。
@@ -2747,20 +2787,59 @@ impl LarkChannel {
         token: &mut String,
         recipient: &str,
         media: &LarkPreparedMediaMessage,
+        root_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let body = serde_json::json!({
-            "receive_id": recipient,
+        let mut body = serde_json::json!({
             "msg_type": media.msg_type,
             "content": media.content.to_string(),
         });
-        let url = self.send_message_url(recipient);
-        self.send_json_with_token_refresh(&url, token, &body, "media send")
-            .await
+        match root_id {
+            Some(root_id) => {
+                // 话题回复：无 receive_id，走 reply 端点，明确以话题形式回复。
+                body["reply_in_thread"] = serde_json::Value::Bool(true);
+                let url = self.reply_message_url(root_id);
+                self.send_json_with_token_refresh(&url, token, &body, "media reply")
+                    .await
+            }
+            None => {
+                body["receive_id"] = serde_json::Value::String(recipient.to_string());
+                let url = self.send_message_url(recipient);
+                self.send_json_with_token_refresh(&url, token, &body, "media send")
+                    .await
+            }
+        }
     }
 
     /// 把飞书事件回调的 payload 解析成零到多条 `ChannelMessage`。
     /// 只认 `im.message.receive_v1`；按消息类型分别取文本（text / post 富文本 /
     /// image 下载成 marker / file 下载成文本或附件说明 / list），
+    /// 从飞书事件里的 `message` 节取话题锚点：仅当消息携带 `thread_id`
+    /// （话题消息独有字段，见飞书"话题概述"）才返回话题根消息 ID
+    /// （`root_id`），普通消息返回 None 以保持现有的逐人会话。
+    fn lark_message_topic_anchor(message: &serde_json::Value) -> Option<String> {
+        let in_thread = message
+            .pointer("/thread_id")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| !t.is_empty());
+        if !in_thread {
+            return None;
+        }
+        message
+            .pointer("/root_id")
+            .and_then(|r| r.as_str())
+            .filter(|r| !r.is_empty())
+            .map(String::from)
+    }
+
+    /// 填充消息的话题字段：话题消息按「人 + 话题」隔离会话历史与中断范围，
+    /// 并且 orchestrator 会把回复的发回锚点（thread_ts）带到出站消息上。
+    fn fill_topic_fields(msg: &mut ChannelMessage, anchor: Option<String>) {
+        if let Some(anchor) = anchor {
+            msg.thread_ts = Some(anchor.clone());
+            msg.interruption_scope_id = Some(anchor);
+        }
+    }
+
     /// 过滤机器人自身消息与白名单外用户，群聊校验 @，最后组装成标准消息。
     /// Parse an event callback payload and extract messages.
     /// Supports text, post, image, and file message types.
@@ -2992,7 +3071,11 @@ impl LarkChannel {
             .and_then(|c| c.as_str())
             .unwrap_or(open_id);
 
-        messages.push(ChannelMessage {
+        let topic_anchor = event
+            .pointer("/message")
+            .and_then(Self::lark_message_topic_anchor);
+
+        let mut channel_msg = ChannelMessage {
             id: evt_message_id.to_string(),
             sender: self.resolve_sender(chat_id, Some(open_id)).to_string(),
             reply_target: chat_id.to_string(),
@@ -3006,7 +3089,9 @@ impl LarkChannel {
             subject: None,
 
             ..Default::default()
-        });
+        };
+        Self::fill_topic_fields(&mut channel_msg, topic_anchor);
+        messages.push(channel_msg);
 
         messages
     }
@@ -3035,7 +3120,12 @@ impl Channel for LarkChannel {
     /// 文本部分按卡片上限分块发交互卡；最后依次发准备好的媒体消息。
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url(&message.recipient);
+        // 话题回复走 reply 端点（锚点 = 话题根消息 ID）；否则普通发消息。
+        let root_id = message.thread_ts.as_deref();
+        let send_url = match root_id {
+            Some(root_id) => self.reply_message_url(root_id),
+            None => self.send_message_url(&message.recipient),
+        };
         let (text_content, raw_markers) = super::util::parse_attachment_markers(&message.content);
         let markers = raw_markers
             .into_iter()
@@ -3053,14 +3143,14 @@ impl Channel for LarkChannel {
         if !text_content.is_empty() || markers.is_empty() {
             let chunks = split_markdown_chunks(&text_content, LARK_CARD_MARKDOWN_MAX_BYTES);
             for chunk in &chunks {
-                let body = build_interactive_card_body(&message.recipient, chunk);
-                self.send_json_with_token_refresh(&url, &mut token, &body, "text send")
+                let body = build_interactive_card_body(&message.recipient, chunk, root_id);
+                self.send_json_with_token_refresh(&send_url, &mut token, &body, "text send")
                     .await?;
             }
         }
 
         for media in &prepared_media {
-            self.send_lark_media_message(&mut token, &message.recipient, media)
+            self.send_lark_media_message(&mut token, &message.recipient, media, root_id)
                 .await?;
         }
 
@@ -3439,8 +3529,12 @@ impl Channel for LarkChannel {
             },
             LARK_CARD_MARKDOWN_MAX_BYTES,
         );
-        let body = build_interactive_card_body(&message.recipient, &placeholder);
-        let url = self.send_message_url(&message.recipient);
+        let root_id = message.thread_ts.as_deref();
+        let body = build_interactive_card_body(&message.recipient, &placeholder, root_id);
+        let url = match root_id {
+            Some(root_id) => self.reply_message_url(root_id),
+            None => self.send_message_url(&message.recipient),
+        };
 
         let (status, response) = match self.patch_or_send_once(&url, &body, false).await {
             Ok(r) => r,
@@ -3559,14 +3653,16 @@ impl Channel for LarkChannel {
         if chunks.len() > 1 {
             let url = self.send_message_url(recipient);
             for chunk in &chunks[1..] {
-                let body = build_interactive_card_body(recipient, chunk);
+                // 溢出的分段里没有话题锚点信息，只能作为顶层消息发送；
+                // 首段已 PATCH 进带 root_id 的草稿卡，主回复仍落在话题内。
+                let body = build_interactive_card_body(recipient, chunk, None);
                 self.send_json_with_token_refresh(&url, &mut token, &body, "finalize_draft chunk")
                     .await?;
             }
         }
 
         for media in &prepared_media {
-            self.send_lark_media_message(&mut token, recipient, media)
+            self.send_lark_media_message(&mut token, recipient, media, None)
                 .await?;
         }
 
@@ -3699,9 +3795,9 @@ impl LarkChannel {
     /// - 成功点击 → 返回带 `ApprovalSource::Operator` 来源的结果；
     /// - 发送端通道断开（oneshot Err）或超时 → 移除 pending 条目，合成一个带
     ///   `Unreachable`/`TimedOut` 来源的 Deny，绝不 panic。
-    /// 带来源是为了区分"用户真拒绝"和"没人拒绝"，避免把机器人自判的拒绝误报成用户拒绝。
-    /// Wait for the user's approval click; on timeout, evict the pending entry
-    /// and synthesize a `Deny` response. Never panics.
+    ///   带来源是为了区分"用户真拒绝"和"没人拒绝"，避免把机器人自判的拒绝误报成用户拒绝。
+    ///   Wait for the user's approval click; on timeout, evict the pending entry
+    ///   and synthesize a `Deny` response. Never panics.
     ///
     /// The returned provenance separates a real click from the synthesized
     /// deny, so the caller does not report an operator refusal nobody made.
@@ -3928,7 +4024,7 @@ impl LarkChannel {
     /// 1. 解析 action.value 里的 `approval_id` 和 `decision`（approve/deny/always）；
     /// 2. 校验 operator 与来源群聊（白名单 + destination 匹配），失败则拒绝但不误解析审批；
     /// 3. 取走 pending 条目 → 通过 oneshot 唤醒等待方 → PATCH 成已决卡片。
-    /// 未知的 decision 明确"不解析审批"，让等待方走超时路径拿到运行时来源，防止误报"用户拒绝"。
+    ///    未知的 decision 明确"不解析审批"，让等待方走超时路径拿到运行时来源，防止误报"用户拒绝"。
     async fn handle_card_action_event(
         &self,
         event_payload: &serde_json::Value,
@@ -5103,6 +5199,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lark_parse_thread_message_fills_topic_fields() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                "message": {
+                    "message_id": "om_followup1",
+                    "message_type": "text",
+                    "content": "{\"text\":\"topic ping\"}",
+                    "chat_id": "oc_chat123",
+                    "chat_type": "group",
+                    "create_time": "1699999999000",
+                    "mentions": [{ "id": { "open_id": "ou_bot" } }],
+                    "thread_id": "omt_d4be107c616a",
+                    "root_id": "om_root_message123"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "topic ping");
+        assert_eq!(msgs[0].thread_ts.as_deref(), Some("om_root_message123"));
+        assert_eq!(
+            msgs[0].interruption_scope_id.as_deref(),
+            Some("om_root_message123")
+        );
+    }
+
+    #[tokio::test]
+    async fn lark_parse_plain_message_leaves_topic_fields_empty() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                "message": {
+                    "message_id": "om_plain1",
+                    "message_type": "text",
+                    "content": "{\"text\":\"plain ping\"}",
+                    "chat_id": "oc_chat123",
+                    "chat_type": "group",
+                    "create_time": "1699999999000",
+                    "mentions": [{ "id": { "open_id": "ou_bot" } }]
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "plain ping");
+        assert!(msgs[0].thread_ts.is_none());
+        assert!(msgs[0].interruption_scope_id.is_none());
+    }
+
+    #[test]
+    fn lark_ws_payload_deserializes_thread_fields() {
+        let payload = serde_json::json!({
+            "sender": {
+                "sender_id": { "open_id": "ou_testuser123" },
+                "sender_type": "user"
+            },
+            "message": {
+                "message_id": "om_followup1",
+                "chat_id": "oc_chat123",
+                "chat_type": "group",
+                "message_type": "text",
+                "content": "{\"text\":\"ws topic\"}",
+                "thread_id": "omt_d4be107c616a",
+                "root_id": "om_root_message123"
+            }
+        });
+
+        let recv: MsgReceivePayload =
+            serde_json::from_value(payload).expect("WS payload should deserialize");
+        assert_eq!(
+            recv.message.thread_id.as_deref(),
+            Some("omt_d4be107c616a"),
+            "thread_id must be surfaced from the WS event payload"
+        );
+        assert_eq!(
+            recv.message.root_id.as_deref(),
+            Some("om_root_message123"),
+            "root_id must be surfaced from the WS event payload"
+        );
+    }
+
+    #[tokio::test]
     async fn lark_parse_unauthorized_user() {
         let ch = make_channel();
         let payload = serde_json::json!({
@@ -5951,9 +6136,11 @@ mod tests {
 
     #[test]
     fn build_interactive_card_body_produces_correct_structure() {
-        let body = build_interactive_card_body("oc_chat123", "**Hello** world");
+        let body = build_interactive_card_body("oc_chat123", "**Hello** world", None);
         assert_eq!(body["receive_id"], "oc_chat123");
         assert_eq!(body["msg_type"], "interactive");
+        assert!(body.get("root_id").is_none());
+        assert!(body.get("reply_in_thread").is_none());
 
         let content: serde_json::Value =
             serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
@@ -5962,6 +6149,23 @@ mod tests {
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0]["tag"], "markdown");
         assert_eq!(elements[0]["content"], "**Hello** world");
+    }
+
+    #[test]
+    fn build_interactive_card_body_embeds_root_id_for_topic() {
+        let body = build_interactive_card_body(
+            "oc_chat123",
+            "reply",
+            Some("om_40eb06e7b84dc71c03e009ad3c754195"),
+        );
+        // 话题回复走 reply 端点：请求体不带 receive_id/root_id（目标在 URL），
+        // 但必须显式 reply_in_thread=true 才会以话题形式回复。
+        assert!(body.get("receive_id").is_none());
+        assert!(body.get("root_id").is_none());
+        assert_eq!(
+            body["reply_in_thread"], true,
+            "reply_in_thread must be true so the reply lands inside the topic"
+        );
     }
 
     #[test]
@@ -7315,6 +7519,11 @@ mod tests {
         .await;
     }
 
+    /// 中文：测试用例二——「发送消息」。
+    ///
+    /// 用配置（`use_feishu=true`，API 指向本地 mock）构造真实渠道句柄，
+    /// 走 `Channel::send` 发一条单聊回复，断言 mock 收到了
+    /// `POST /im/v1/messages`，且 receive_id / 文本载荷正确。
     #[tokio::test]
     async fn feishu_send_via_from_config_emits_post_to_messages_endpoint() {
         let mock_server = wiremock::MockServer::start().await;
@@ -7352,6 +7561,81 @@ mod tests {
         .await;
     }
 
+    /// 中文：测试用例一——「拉取/读取消息」。
+    ///
+    /// 模拟飞书把用户在单聊（p2p）中发送的 `im.message.receive_v1` 事件 POST 到
+    /// webhook——这正是 `listen()` 在 `Webhook` 模式下交给 `handle_lark_http_event`
+    /// 的同一请求。事件经明文 token 校验、`is_user_allowed` 放行后，被解析成
+    /// `ChannelMessage` 送入 `tx` 管道；我们从 `rx` 侧读出这条消息并断言其内容与会话目标。
+    ///
+    /// （「发送消息」的测试用例见 `feishu_send_via_from_config_emits_post_to_messages_endpoint`；
+    /// 真实联调的收发完整流程见 `examples/feishu_echo.rs`。）
+    #[tokio::test]
+    async fn feishu_listen_receives_webhook_message() {
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: true,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            verification_token: Some("test_verification_token".to_string()),
+            approval_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut ch = with_bot_open_id(
+            LarkChannel::from_config(
+                &config,
+                "test_alias",
+                resolver_from(vec!["ou_testuser123".into()]),
+            ),
+            "ou_bot",
+        );
+        // 关闭入站快速 ❤ 表情回应：本用例只读取消息，不触发任何出站 HTTP 请求。
+        ch.ack_reactions = false;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = LarkHttpAppState {
+            verification_token: "test_verification_token".to_string(),
+            channel: Arc::new(ch),
+            tx,
+        };
+        let event_payload = serde_json::json!({
+            // 明文 webhook 事件用顶层 token 通过 verify_challenge_token 校验
+            "token": "test_verification_token",
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                "message": {
+                    "message_id": "om_inbound_0001",
+                    "message_type": "text",
+                    "content": r#"{"text":"帮我查一下明早的会议安排"}"#,
+                    "chat_type": "p2p",
+                    "chat_id": "oc_p2p_chat",
+                    "create_time": "1710000000000"
+                }
+            }
+        });
+        let response = handle_lark_http_event(
+            State(state),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(serde_json::to_vec(&event_payload).unwrap()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "webhook 应对合法事件返回 200"
+        );
+
+        // 编排器一侧从入站管道读到的消息
+        let inbound = rx.recv().await.expect("webhook 应把入站消息送入 tx 管道");
+        assert_eq!(inbound.channel, "lark");
+        assert_eq!(inbound.id, "om_inbound_0001");
+        assert_eq!(inbound.content, "帮我查一下明早的会议安排");
+        // 单聊（p2p）且未开 per_user_session 时，sender 与会话目标都落到 chat_id
+        assert_eq!(inbound.sender, "oc_p2p_chat");
+        assert_eq!(inbound.reply_target, "oc_p2p_chat");
+    }
+
     #[tokio::test]
     async fn lark_send_uses_open_id_for_open_id_recipient() {
         let mock_server = wiremock::MockServer::start().await;
@@ -7380,6 +7664,85 @@ mod tests {
             "hi from cron",
         )
         .await;
+    }
+
+    /// 中文：话题消息的回复必须走「回复消息」端点才能落回原话题。
+    ///
+    /// `SendMessage.thread_ts` 在入站解析时被填成话题根消息 ID（`message.root_id`）。
+    /// 本用例验证 `send` 把 `thread_ts` 作为 reply 端点的目标消息 ID，
+    /// 并在 body 里置 `reply_in_thread=true`——飞书发消息接口（create）的
+    /// 请求体不支持 root_id/reply_in_thread，话题回复只能走
+    /// `POST /im/v1/messages/{root_id}/reply`。
+    #[tokio::test]
+    async fn feishu_send_with_thread_ts_replies_into_thread() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages/om_root_message123/reply"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "message_id": "om_reply_1",
+                    "thread_id": "omt_d4be107c616a"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: true,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
+        ch.api_base_override = Some(mock_server.uri());
+
+        let message = SendMessage::new("topic reply", "oc_test_chat_id")
+            .in_thread(Some("om_root_message123".to_string()));
+        Channel::send(&ch, &message)
+            .await
+            .expect("send should succeed against mocked Feishu endpoint");
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("mock server should record requests");
+        let reply_request = requests
+            .iter()
+            .find(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/im/v1/messages/om_root_message123/reply"
+            })
+            .expect("expected a POST to the reply endpoint");
+        assert!(
+            reply_request.url.query().is_none(),
+            "reply endpoint takes the target message id in the path, no query params"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&reply_request.body).expect("reply body should be valid JSON");
+        assert_eq!(
+            body["reply_in_thread"].as_bool(),
+            Some(true),
+            "topic replies must set reply_in_thread=true; full body: {body}"
+        );
+        assert!(
+            body.get("receive_id").is_none(),
+            "reply endpoint body must not carry receive_id; full body: {body}"
+        );
     }
 
     #[tokio::test]

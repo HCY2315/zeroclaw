@@ -1177,10 +1177,15 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 
 #[cfg(test)]
 mod capability_tests {
+    //! 供应商能力声明的兼容性测试：验证模型感知能力查询 `capabilities_for_model`
+    //! 会保留历史遗留 accessor（`supports_native_tools` 等）的覆盖行为。
+
     use super::ModelProvider;
     use crate::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use async_trait::async_trait;
 
+    /// 中文：测试夹具——只覆盖 `supports_native_tools()`（遗留 accessor）与必选方法
+    /// `chat_with_system`，`capabilities()` 走默认（全 false）。
     struct NativeAccessorOnlyProvider;
 
     impl Attributable for NativeAccessorOnlyProvider {
@@ -1210,6 +1215,9 @@ mod capability_tests {
         }
     }
 
+    /// 中文：验证 `capabilities_for_model` 会保留遗留 accessor 的覆盖——
+    /// 即使 `capabilities()` 默认返回 `native_tool_calling=false`，
+    /// 只要厂商覆写了 `supports_native_tools() -> true`，模型级查询仍应给出 `true`。
     #[test]
     fn model_capabilities_preserve_native_accessor_overrides() {
         let provider = NativeAccessorOnlyProvider;
@@ -1229,8 +1237,14 @@ mod capability_tests {
 
 #[cfg(test)]
 mod turn_order_tests {
+    //! 会话历史「回合次序」与「语义空终态」判定测试：
+    //! 覆盖 `ChatMessage::sanitize_leading_turn_order` 与
+    //! `ChatResponse::is_semantically_empty_terminal` 的边界行为。
+
     use super::{ChatMessage, ChatResponse, ToolCall};
 
+    /// 中文：只有思考内容、没有可见文字的响应（text 为空白 + reasoning_content 有值）
+    /// 应判定为「语义空终态」——思考内容不参与判定。
     #[test]
     fn semantic_empty_terminal_ignores_reasoning_content() {
         let response = ChatResponse {
@@ -1243,6 +1257,8 @@ mod turn_order_tests {
         assert!(response.is_semantically_empty_terminal());
     }
 
+    /// 中文：剥除内联 ` thinking...response` 思考片段后没有剩余可见文字，
+    /// 判定为空终态（思考标签内的内容不算最终输出）。
     #[test]
     fn semantic_empty_terminal_uses_display_text_after_think_tag_stripping() {
         let response = ChatResponse {
@@ -1255,6 +1271,7 @@ mod turn_order_tests {
         assert!(response.is_semantically_empty_terminal());
     }
 
+    /// 中文：仅含工具调用（text 为空）的响应不算空终态——工具调用本身就代表有效进展。
     #[test]
     fn semantic_empty_terminal_keeps_tool_only_response_valid() {
         let response = ChatResponse {
@@ -1272,6 +1289,7 @@ mod turn_order_tests {
         assert!(!response.is_semantically_empty_terminal());
     }
 
+    /// 中文：含正常最终文字的响应不算空终态。
     #[test]
     fn text_response_is_not_semantically_empty() {
         let response = ChatResponse {
@@ -1284,6 +1302,7 @@ mod turn_order_tests {
         assert!(!response.is_semantically_empty_terminal());
     }
 
+    /// 中文：仅含工具调用同样不算空终态（与上一处语义一致，作为对照用例）。
     #[test]
     fn tool_only_response_is_not_semantically_empty() {
         let response = ChatResponse {
@@ -1301,6 +1320,8 @@ mod turn_order_tests {
         assert!(!response.is_semantically_empty_terminal());
     }
 
+    /// 中文：删掉开头孤立出现的 assistant 工具调用与 tool 结果，
+    /// 保留到第一个 `user` 之前为止，把残片历史修整为合法回合序。
     #[test]
     fn drops_leading_assistant_tool_call_before_first_user() {
         let mut msgs = vec![
@@ -1315,6 +1336,7 @@ mod turn_order_tests {
         assert_eq!(msgs[1].content, "actual user");
     }
 
+    /// 中文：开头孤立的 tool 结果（没有前置 assistant 调用）同样被丢弃。
     #[test]
     fn drops_leading_orphan_tool_turn() {
         let mut msgs = vec![ChatMessage::tool("orphan result"), ChatMessage::user("hi")];
@@ -1323,6 +1345,7 @@ mod turn_order_tests {
         assert_eq!(msgs[0].role, "user");
     }
 
+    /// 中文：已以 `user` 打头的合法历史保持不变（修整是幂等的）。
     #[test]
     fn preserves_already_valid_history() {
         let mut msgs = vec![
@@ -1338,6 +1361,7 @@ mod turn_order_tests {
         assert_eq!(msgs[1].role, "user");
     }
 
+    /// 中文：没有任何 `user` 回合时，所有非 system 消息都被丢弃，只保留 system。
     #[test]
     fn no_user_turn_drops_all_non_system() {
         let mut msgs = vec![
@@ -1350,6 +1374,7 @@ mod turn_order_tests {
         assert_eq!(msgs[0].role, "system");
     }
 
+    /// 中文：空历史不做任何修改（修整是 no-op）。
     #[test]
     fn empty_history_is_noop() {
         let mut msgs: Vec<ChatMessage> = vec![];
@@ -1360,13 +1385,18 @@ mod turn_order_tests {
 
 #[cfg(test)]
 mod thinking_display_tests {
+    //! `ThinkingDisplay` / `NativeThinkingParams` 的取值映射与序列化测试：
+    //! 覆盖 `as_str` 映射以及 `display` 字段序列化时「有则带、无则省略」的约定。
+
     use super::{NativeThinkingParams, ThinkingDisplay};
 
+    /// 中文：`ThinkingDisplay::Updates` 应映射为线上取值字符串 `"updates"`。
     #[test]
     fn as_str_maps_updates_variant() {
         assert_eq!(ThinkingDisplay::Updates.as_str(), "updates");
     }
 
+    /// 中文：`display=Some(...)` 时，序列化结果必须包含 `"display":"updates"` 字段。
     #[test]
     fn serialization_includes_display_when_present() {
         let params = NativeThinkingParams {
@@ -1380,6 +1410,8 @@ mod thinking_display_tests {
         );
     }
 
+    /// 中文：`display=None` 时，序列化结果不得出现 `display` 字段，
+    ///   保持扩展思考 beta 之前的请求形状。
     #[test]
     fn serialization_omits_display_when_absent() {
         let params = NativeThinkingParams {

@@ -312,3 +312,9 @@ wiremock = "0.6"
 # waits without the suite sleeping for it. Dev-only, and the same feature
 # zeroclaw-providers already carries for the same reason.
 tokio = { version = "1.50", features = ["macros", "rt-multi-thread", "test-util"] }
+
+# 飞书真实联调示例依赖 `lark` 模块（由 channel-lark feature 门控），
+# 不启用该 feature 时跳过示例构建，避免 `cargo test`/`clippy --all-targets` 全量报错。
+[[example]]
+name = "feishu_echo"
+required-features = ["channel-lark"]
