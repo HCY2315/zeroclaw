@@ -1,11 +1,25 @@
 #![allow(clippy::to_string_in_format_args)]
 //! Memory subsystem: backends, embeddings, consolidation, retrieval.
+//!
+//! 记忆子系统：本 crate 负责把配置里的任意 memory backend（sqlite / lucid /
+//! postgres / qdrant / markdown / none）统一构造成带完整安全层的 `Memory`
+//! 实例，并对外暴露创建入口、embedding 配置解析、快照水合、响应缓存等能力。
+//! 典型使用方式是经 `create_memory_from_config` / `create_memory_for_agent`
+//! 拿到一个 `Box<dyn Memory>`（外层依次包扫描、可选审计、检索管道等装饰器）。
 
 /// Opening delimiter for recalled memory injected into provider context.
+/// 召回记忆注入 prompt 时的起始分隔符（`[Memory context]`）。
 pub const MEMORY_CONTEXT_OPEN: &str = "[Memory context]";
 /// Closing delimiter for recalled memory injected into provider context.
+/// 召回记忆注入 prompt 时的结束分隔符。召回内容会被拼在 <起始符>...<结束符> 之间。
 pub const MEMORY_CONTEXT_CLOSE: &str = "[/Memory context]";
 
+// 子模块一览（按职责分）：backend=后端类型分类；sqlite/lucid/markdown/none/
+// qdrant/postgres=各存储后端实现；agent_scoped*=多代理隔离包装；scanned/
+// audit/policy_gate/redact/threat=安全与策略装饰层；embeddings/vector/
+// rerank=向量召回能力；chunker/classify/importance/decay/dedup/merge/conflict/
+// consolidation=记忆生命周期处理；knowledge_graph*=知识图谱；snapshot/hygiene=
+// 持久化兜底；retrieval/response_cache/budget=检索与缓存工具。
 pub mod agent_scoped;
 pub mod agent_scoped_markdown;
 pub mod audit;
@@ -45,6 +59,9 @@ pub mod threat;
 pub mod traits;
 pub mod vector;
 
+// 对外简化 re-export：调用方一般只需 `memory::Memory` 特征、`MemoryCategory`/
+// `MemoryEntry` 数据结构和几个工厂函数（create_memory* / create_response_cache）。
+// `adapter` 语义：`Memory` 是所有后端共享的读写/召回接口，这里统一导出。
 pub use agent_scoped::{AgentMemoryGrant, AgentScopedMemory};
 pub use agent_scoped_markdown::{AgentScopedMarkdownMemory, MarkdownPeer};
 pub use audit::AuditedMemory;
@@ -87,6 +104,8 @@ use zeroclaw_config::schema::{
 };
 
 #[cfg(feature = "memory-postgres")]
+// 已开启 `memory-postgres` 特性：从 `[storage.postgres.<alias>]` 配置直接构造
+// PostgresMemory，连接串可走 schema/table，向量列可选。
 fn build_postgres_memory(
     storage: &PostgresStorageConfig,
 ) -> anyhow::Result<postgres::PostgresMemory> {
@@ -107,6 +126,7 @@ fn build_postgres_memory(
 }
 
 #[cfg(not(feature = "memory-postgres"))]
+// 未开启该特性时给出清晰报错：直接提示需要重新以 `--features memory-postgres` 构建。
 fn build_postgres_memory(_storage: &PostgresStorageConfig) -> anyhow::Result<Box<dyn Memory>> {
     anyhow::bail!(
         "memory backend 'postgres' requested but this build was compiled without \
@@ -118,6 +138,8 @@ fn build_postgres_memory(_storage: &PostgresStorageConfig) -> anyhow::Result<Box
 /// `[memory] audit_enabled = true`; pass it through untouched otherwise
 /// (the default), so the flag-off path is byte-identical to an unwrapped
 /// backend.
+/// 中文：audit_enabled=true 时把后端包成带审计的 AuditedMemory（store/recall 会记录审计行），
+/// 默认 false 时原样返回，保证"关审计 = 与不包装逐字节一致"。
 fn wrap_audit<M: Memory + 'static>(
     memory: M,
     workspace_dir: &Path,
@@ -133,6 +155,8 @@ fn wrap_audit<M: Memory + 'static>(
 /// Compose the two install-wide decorators exactly once. Content scanning is
 /// closest to storage; the optional audit wrapper observes the resulting
 /// success or failure without bypassing the security boundary.
+/// 中文：统一组装"内容扫描 + 可选审计"两层装饰器，顺序固定（扫描贴着存储层，
+/// 审计在最外层观察成败），全局工厂共用一个打包路径。
 fn wrap_scanned_and_audit<M: Memory + 'static>(
     memory: M,
     policy: &MemoryPolicyConfig,
@@ -146,6 +170,9 @@ fn wrap_scanned_and_audit<M: Memory + 'static>(
     )
 }
 
+// 无需 storage 配节的简化工厂：按 backend 名分发到各后端构造器，统一套上
+// 扫描+审计装饰。Sqlite/Lucid/Markdown/None 都从这里走；Postgres/Qdrant
+// 必须带 storage 配置（走 create_memory_with_storage_and_routes），这里直接报错。
 fn create_memory_with_builders<F>(
     backend_name: &str,
     workspace_dir: &Path,
@@ -208,6 +235,8 @@ where
 
 /// Extract the backend kind from a V3 dotted reference (`<kind>.<alias>`).
 /// Bare names (`"sqlite"`) are returned as-is. Returned lowercase.
+/// 中文：从 `backend = "<kind>.<alias>"` 形式剥出 `<kind>`（如 "sqlite.main" → "sqlite"），
+/// 裸名原样返回并统一小写。
 pub fn backend_kind_from_dotted(memory_backend: &str) -> String {
     memory_backend
         .trim()
@@ -218,11 +247,14 @@ pub fn backend_kind_from_dotted(memory_backend: &str) -> String {
 
 /// Legacy auto-save key used for model-authored assistant summaries.
 /// These entries are treated as untrusted context and should not be re-injected.
+/// 中文：识别"助手自动保存"的遗留键名（assistant_resp*）：这些是模型自己写的摘要，
+/// 视为不可信上下文，不能回灌给模型。
 pub fn is_assistant_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
 }
 
+// 识别用户侧自动保存键名（user_msg*），用于区分哪条记忆源自用户消息。
 pub fn is_user_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     normalized == "user_msg" || normalized.starts_with("user_msg_")
@@ -247,6 +279,10 @@ pub fn is_user_autosave_key(key: &str) -> bool {
 ///
 /// Exhaustive match on purpose: a new origin variant must decide its
 /// autosave posture here explicitly.
+/// 中文：决定一个"轮次来源"是否允许把用户侧文本自动存成 Conversation 记忆。
+/// 交互/渠道/直连 agent 来源可存；定时任务（cron/daemon）与子轮次（SubTurn）禁存——
+/// 它们的"用户消息"其实是运营配置的任务 prompt 或父轮转生成文本，存进去会把内部合成
+/// 文本喂回召回。穷举 match 是故意的：新增来源必须在这里显式表态。
 pub fn should_autosave_origin(origin: zeroclaw_api::ingress::TurnOrigin) -> bool {
     use zeroclaw_api::ingress::TurnOrigin;
     match origin {
@@ -257,6 +293,9 @@ pub fn should_autosave_origin(origin: zeroclaw_api::ingress::TurnOrigin) -> bool
 
 /// Filter known synthetic autosave noise patterns that should not be
 /// persisted as user conversation memories.
+/// 中文：兜底过滤明显是"合成内容"的自动保存噪音（定时任务 prompt、会话/蒸馏模板、
+/// 上下文回灌片段等），这些不应写成 user_msg 记忆。注意真正的关卡在 `should_autosave_origin`，
+/// 内容过滤只是针对历史存储/无来源表面的最后防线。
 pub fn should_skip_autosave_content(content: &str) -> bool {
     let normalized = content.trim();
     if normalized.is_empty() {
@@ -295,6 +334,7 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
     }
 }
 
+// 已解析的 embedding 配置；Debug 故意不打印 api_key（防止密钥进日志）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingSettings {
     pub model_provider: String,
@@ -303,6 +343,8 @@ pub struct EmbeddingSettings {
     pub api_key: Option<String>,
 }
 
+// 对外只读视图：把内部 ResolvedEmbeddingConfig 转成公开的 EmbeddingSettings（供
+// 上层查看/透传），同样不暴露 api_key 到 Debug。
 pub fn resolve_embedding_settings(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
@@ -318,6 +360,11 @@ pub fn resolve_embedding_settings(
     }
 }
 
+// 解析 embedding 的实际配置：
+//  1. 取 `[memory].embedding_provider/model/dimensions/api_key`；
+//  2. 若 embedding_model 以 `hint:` 开头，则去 `[embedding_routes]` 查同名路由，命中后用
+//     路由的 provider/model/dimensions/api_key，未命中/非法则回退默认；
+//  3. 最终统一走 resolve_provider_ref 把 `kind.alias` 引用解析成可用的 concrete provider。
 fn resolve_embedding_config(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
@@ -400,6 +447,11 @@ fn resolve_embedding_config(
     )
 }
 
+// 把 embedding provider 引用解析为具体可调用的 provider：
+//  - 非 `custom:` 且不带 `.` 的裸名（如 "openai"）：原样返回；
+//  - 带 `.` 的点分引用（如 "openai.my-profile"）：到 providers.models 里按名查找；
+//    找到则用其 api_key，并在带 uri 时拼成 `custom:{uri}`（自定义兼容端点），
+//    无可用 embedding 端点或引用解析不到时按错误原因 WARN 并降级为纯关键词召回（dimensions 不变）。
 fn resolve_provider_ref(
     model_provider: String,
     model: String,
@@ -489,6 +541,8 @@ fn resolve_provider_ref(
     }
 }
 
+// 简化入口：只给 MemoryConfig（不带完整 Config / storage / 路由），backend 必须是裸名。
+// 生产路径请用下方 create_memory_from_config / create_memory_with_storage_and_routes。
 pub fn create_memory(
     config: &MemoryConfig,
     workspace_dir: &Path,
@@ -515,6 +569,9 @@ pub fn create_memory(
 ///
 /// Config-aware production paths should use this entrypoint so the selected
 /// storage alias, embedding route, and provider settings are applied together.
+/// 中文：生产环境推荐入口。基于完整 Config 一次成型：backend 用 `memory.backend`
+/// （可带 storage 别名），embedding 走 `[embedding_routes]`+providers 解析，
+/// data_dir 取 `config.data_dir`，并顺带跑一趟按频控的记忆卫生/快照/冷启动水合。
 pub fn create_memory_from_config(
     config: &Config,
     api_key: Option<&str>,
@@ -529,6 +586,9 @@ pub fn create_memory_from_config(
     )
 }
 
+// Lucid 构造：仍然先建一个本地 SqliteMemory 作为底层存储，外面再包 LucidMemory
+// （把读写重定向给外部 lucid 进程做图形检索）。若配置解析出了 `storage.lucid.<alias>`
+// 则用其 binary_path/超时覆盖默认，否则全用默认值。兼容裸 `backend = "lucid"` 的旧形式。
 fn build_lucid_memory(
     workspace_dir: &Path,
     local: SqliteMemory,
@@ -556,6 +616,9 @@ fn build_lucid_memory(
     )
 }
 
+// 核心工厂（带 storage 别名 + embedding 路由）：所有 backend 的统一构造入口。
+// 流程：解析 backend 种类 → 解析 embedding → 背靠背跑卫生/快照/水合（都失败仅 WARN 不阻塞）→
+// 按分支构造后端并套装饰器。Postgres/Qdrant 分支必须能解析到对应的 `storage.<type>.<alias>`。
 pub fn create_memory_with_storage_and_routes(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
@@ -634,6 +697,8 @@ pub fn create_memory_with_storage_and_routes(
         }
     }
 
+    // 每次构建 sqlite 后端：建 embedder（dimensions>0 说明向量可用）→ SqliteMemory 带权重
+    // 与搜索模式 → 若存在 embedder 则做一次 embedding identity 对账（prefer 生成/失效向量）。
     fn build_sqlite_memory(
         config: &MemoryConfig,
         sqlite_open_timeout_secs: Option<u64>,
@@ -776,6 +841,7 @@ pub fn create_memory_with_storage_and_routes(
 }
 
 /// Outcome of a startup embedding-identity reconciliation.
+/// 启动时 embedding 配置对账的四种结果：新库直接采纳 / 与已存一致 / config 变了触发向量失效 / 对账失败（仅记日志，启动继续）。
 #[derive(Debug, PartialEq, Eq)]
 enum EmbeddingIdentityOutcome {
     /// No identity was recorded (fresh store, or one predating identity
@@ -792,6 +858,10 @@ enum EmbeddingIdentityOutcome {
     Failed,
 }
 
+// 对账：启动时把当前 embedding 配置与库内记录的 identity 对比。不一致时把
+// 存量向量置 NULL、清 embedding 缓存并写入新 identity（内容保留，召回降级为
+// 关键词，直到 `zeroclaw memory reindex` 或自动重嵌入）。任何失败均只 WARN，
+// 下次启动重试。
 fn reconcile_embedding_identity(
     mem: &SqliteMemory,
     current: &embeddings::EmbeddingIdentity,
@@ -868,6 +938,8 @@ fn reconcile_embedding_identity(
 /// migration, when `[memory] auto_reindex_on_identity_change` opts in.
 /// Outside an async runtime (no tokio context) the spawn is skipped and the
 /// operator is pointed at `zeroclaw memory reindex` instead.
+/// 中文：若配置允许，identity 变更且向量被失效后，在后台跑一次全量重嵌入。
+/// 当前上下文里没有 tokio runtime 时直接跳过并提示手动 `zeroclaw memory reindex`。
 fn spawn_auto_reindex(mem: &SqliteMemory) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         ::zeroclaw_log::record!(
@@ -903,6 +975,9 @@ fn spawn_auto_reindex(mem: &SqliteMemory) {
     });
 }
 
+// 迁移专用工厂：给 `memory list/get/导入` 等操作员的批量命令用的宽松策略——
+// 被威胁扫描命中的行仍会落库（导入不许半途而废）、读取不拦截（便于检查删除），
+// 并跳过审计（导入是历史批量数据，不是实时记忆操作）。
 pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Memory>> {
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
@@ -955,6 +1030,8 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
 /// activating the decorator does not change default per-agent recall. The
 /// reserved `"fts"` / `"vector"` names and `fts_early_return_score` are inert
 /// until `Memory` exposes distinct FTS and vector operations.
+/// 中文：给 agent 记忆套最外层检索管道装饰器（一次查询一次混合召回）。是否加进程内
+/// 热缓存由 `[memory].retrieval_stages` 是否含 "cache" 决定，默认不含，因此默认行为不变。
 fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) -> Arc<dyn Memory> {
     let cache_enabled = config.retrieval_stages.iter().any(|stage| stage == "cache");
     Arc::new(retrieval::RetrievalPipeline::new(
@@ -983,6 +1060,9 @@ fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) ->
 /// the time we get here every entry on
 /// `agents.<alias>.workspace.read_memory_from` is guaranteed to point
 /// at a sibling on the same backend kind.
+/// 中文：按 agent 别名构造"多代理隔离"的记忆句柄。SQL/Qdrant 系共享一个底层后端
+/// 并用 agent_id 列区分；Markdown 系为每个 agent 建独立目录并按 grant allowlist 组合
+/// 伙伴句柄；None 后端正交通过。最外层统一包检索管道装饰器（None 跳过）。
 pub async fn create_memory_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -1121,6 +1201,8 @@ pub async fn create_memory_for_agent(
 }
 
 /// Factory: create an optional response cache from config.
+/// 中文：响应缓存工厂——`response_cache_enabled=true` 时在 workspace 下建一个带
+/// TTL/上限的文件缓存（命中可跳过重复生成）；配置异常时仅 WARN 并禁用，不阻塞启动。
 pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Option<ResponseCache> {
     if !config.response_cache_enabled {
         return None;
